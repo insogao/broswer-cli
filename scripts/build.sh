@@ -11,7 +11,8 @@ Usage: scripts/build.sh [options]
 
 Runs `ninja -C out/Dev -j 6 chrome` with:
   - a pre-build disk gate (DISK_MIN_GIB, default 25 GiB)
-  - a runtime watchdog that terminates ninja if free space drops below the gate
+  - an always-on runtime watchdog that terminates ninja if free space drops
+    below the gate (there is no bypass option)
   - depot_tools python3 first on PATH (Xcode 27 shim workaround)
 
 Options:
@@ -20,7 +21,6 @@ Options:
   --jobs N          parallel jobs (default 6; >6 requires --allow-more-jobs)
   --allow-more-jobs allow --jobs above MAX_JOBS (default 6)
   --keep-going      pass -k 0 (keep going after failures)
-  --no-watchdog     disable the runtime disk watchdog (pre-build gate still applies)
   --help            this message
 
 Environment overrides: CHROMIUM_ROOT, OUT_NAME, BUILD_JOBS, MAX_JOBS,
@@ -31,7 +31,6 @@ EOF
 TARGET="chrome"
 JOBS="$BUILD_JOBS"
 KEEP_GOING=0
-WATCHDOG=1
 ALLOW_MORE_JOBS=0
 
 while [ $# -gt 0 ]; do
@@ -42,7 +41,6 @@ while [ $# -gt 0 ]; do
     --jobs) shift; [ $# -gt 0 ] || die "--jobs needs a value"; JOBS="$1" ;;
     --allow-more-jobs) ALLOW_MORE_JOBS=1 ;;
     --keep-going) KEEP_GOING=1 ;;
-    --no-watchdog) WATCHDOG=0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
@@ -64,8 +62,8 @@ if [ "$DRY_RUN" = "1" ]; then
   printf '[dry-run] (cd %q && %q' "$CHROMIUM_SRC" "$NINJA"
   printf ' %q' "${NINJA_ARGS[@]}"
   printf ' %q)\n' "$TARGET"
-  printf '[dry-run] log dir: %s ; watchdog: %s (min %s GiB); disk_now=%s GiB\n' \
-    "$LOG_DIR" "$WATCHDOG" "$DISK_MIN_GIB" "$(disk_avail_gib)"
+  printf '[dry-run] log dir: %s ; watchdog: always-on (min %s GiB); disk_now=%s GiB\n' \
+    "$LOG_DIR" "$DISK_MIN_GIB" "$(disk_avail_gib)"
   printf '[dry-run] nothing executed\n'
   exit 0
 fi
@@ -86,7 +84,7 @@ log "log file: $LOG"
 
 "$NINJA" "${NINJA_ARGS[@]}" "$TARGET" >"$LOG" 2>&1 &
 NINJA_PID=$!
-log "ninja pid=$NINJA_PID (watchdog: $WATCHDOG, min ${DISK_MIN_GIB} GiB)"
+log "ninja pid=$NINJA_PID (runtime watchdog always on, min ${DISK_MIN_GIB} GiB)"
 
 AVAIL="$(disk_avail_gib)"
 WATCHDOG_STOPPED=0
@@ -94,17 +92,14 @@ while kill -0 "$NINJA_PID" 2>/dev/null; do
   sleep 60
   AVAIL="$(disk_avail_gib)"
   if [ "$AVAIL" -lt "$DISK_MIN_GIB" ]; then
-    if [ "$WATCHDOG" = "1" ]; then
-      warn "disk watchdog: ${AVAIL} GiB < ${DISK_MIN_GIB} GiB; terminating ninja"
-      pkill -TERM -P "$NINJA_PID" 2>/dev/null || true
-      kill -TERM "$NINJA_PID" 2>/dev/null || true
-      sleep 15
-      pkill -KILL -P "$NINJA_PID" 2>/dev/null || true
-      kill -KILL "$NINJA_PID" 2>/dev/null || true
-      WATCHDOG_STOPPED=1
-      break
-    fi
-    warn "disk below gate (${AVAIL} GiB) but watchdog is disabled"
+    warn "disk watchdog: ${AVAIL} GiB < ${DISK_MIN_GIB} GiB; terminating ninja"
+    pkill -TERM -P "$NINJA_PID" 2>/dev/null || true
+    kill -TERM "$NINJA_PID" 2>/dev/null || true
+    sleep 15
+    pkill -KILL -P "$NINJA_PID" 2>/dev/null || true
+    kill -KILL "$NINJA_PID" 2>/dev/null || true
+    WATCHDOG_STOPPED=1
+    break
   fi
 done
 

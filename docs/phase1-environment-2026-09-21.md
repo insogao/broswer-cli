@@ -18,6 +18,7 @@
 revision  7d0f28c30d1c0fadbce17ecec0ee2565aef9a940  (2026-09-20 19:37:49 -0700)
 version   156.0.8067.0
 方式      fetch --no-history chromium（shallow，.git/shallow 存在；不维护完整 Git cache）
+复现      scripts/checkout.sh 默认固定到本 revision：fetch → git fetch --depth 1 + checkout --detach（经代理）→ gclient sync --no-history --revision src@<rev>（经代理）；HEAD != VERSION 时 verify-phase1 默认 FAIL
 状态      最终 git status --porcelain 干净
 ```
 

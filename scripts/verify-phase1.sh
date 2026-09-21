@@ -2,7 +2,8 @@
 # Browser CLI Phase 1 verification (no visible UI).
 #
 # Steps:
-#   0. config consistency: chromium/args.gn == out/Dev/args.gn; VERSION revision known
+#   0. config consistency: chromium/args.gn == out/Dev/args.gn; checkout HEAD must
+#      equal the chromium/VERSION revision (mismatch is FAIL unless --allow-tip)
 #   1. artifacts: Chromium.app binary/framework/Info.plist, arm64, codesign structure
 #   2. no-UI smoke: `Chromium.app/Contents/MacOS/Chromium --version` (bounded, no `open`)
 #   3. empty incremental: ninja -> expect "no work to do"
@@ -23,6 +24,11 @@ Phase 1 acceptance for an already-built Chromium checkout. No visible UI.
 
 Options:
   --dry-run            print the plan without executing it (read-only)
+  --check-only         read-only step 0 only: args.gn parity + HEAD == VERSION
+                       revision check, then exit (no smoke, no ninja)
+  --allow-tip          opt out of the HEAD == VERSION revision requirement.
+                       Only for tip builds; NOT valid for reproducibility
+                       acceptance (the default is FAIL on mismatch).
   --skip-smoke         skip the `--version` smoke
   --skip-incremental   skip the real C++ incremental probe/restore loop
   --probe-file REL     repo-relative .cc file for the incremental probe
@@ -36,6 +42,8 @@ EOF
 
 SKIP_SMOKE=0
 SKIP_INCREMENTAL=0
+CHECK_ONLY=0
+ALLOW_TIP=0
 PROBE_REL="base/debug/alias.cc"
 SMOKE_TIMEOUT=180
 
@@ -43,6 +51,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --dry-run) DRY_RUN=1 ;;
+    --check-only) CHECK_ONLY=1 ;;
+    --allow-tip) ALLOW_TIP=1 ;;
     --skip-smoke) SKIP_SMOKE=1 ;;
     --skip-incremental) SKIP_INCREMENTAL=1 ;;
     --probe-file) shift; [ $# -gt 0 ] || die "--probe-file needs a value"; PROBE_REL="$1" ;;
@@ -64,7 +74,8 @@ if [ "$DRY_RUN" = "1" ]; then
   cat <<EOF
 [dry-run] verify-phase1 would run:
   0. compare $BROWSER_CLI_ROOT/chromium/args.gn with out/$OUT_NAME/args.gn
-     and check chromium/VERSION revision ($PINNED_REV) in the checkout
+     and require checkout HEAD == chromium/VERSION revision ($PINNED_REV);
+     HEAD mismatch is FAIL by default (--allow-tip=$ALLOW_TIP opt-out for tip builds)
   1. artifact checks: $APP_DIR (binary, framework, Info.plist=$EXPECTED_VERSION, arm64, codesign -dv)
   2. smoke (skipped=$SKIP_SMOKE, timeout=${SMOKE_TIMEOUT}s):
      "$APP_BIN" --version   # no "open"/Dock/Launchpad, no window, residual-process check after
@@ -72,6 +83,7 @@ if [ "$DRY_RUN" = "1" ]; then
   4. incremental probe (skipped=$SKIP_INCREMENTAL) on $PROBE_REL:
      append static_assert -> ninja -> count edges -> restore via
      \`git cat-file blob HEAD:$PROBE_REL\` -> verify clean -> ninja -> expect "no work to do"
+  check-only mode: $CHECK_ONLY (step 0 only, read-only)
 [dry-run] nothing executed
 EOF
   exit 0
@@ -127,13 +139,30 @@ else
 fi
 HEAD_REV="$(checkout_revision || true)"
 note "INFO  checkout HEAD = $HEAD_REV"
-if [ -n "$PINNED_REV" ]; then
+if [ -z "$PINNED_REV" ]; then
+  if [ "$ALLOW_TIP" = "1" ]; then
+    note "WARN  no revision= in chromium/VERSION; tip mode explicitly allowed (NOT valid for acceptance)"
+  else
+    die "chromium/VERSION has no revision= line; fix it or pass --allow-tip for a non-acceptance tip check"
+  fi
+else
   if git -C "$CHROMIUM_SRC" rev-parse --verify "${PINNED_REV}^{commit}" >/dev/null 2>&1; then
     note "PASS  chromium/VERSION revision exists in checkout ($PINNED_REV)"
   else
     die "chromium/VERSION revision $PINNED_REV not found in checkout"
   fi
-  [ "$HEAD_REV" = "$PINNED_REV" ] || note "INFO  HEAD differs from pinned VERSION revision (ok for tip builds)"
+  if [ "$HEAD_REV" = "$PINNED_REV" ]; then
+    note "PASS  checkout HEAD == chromium/VERSION revision"
+  elif [ "$ALLOW_TIP" = "1" ]; then
+    note "WARN  HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV); tip mode allowed (NOT valid for reproducibility acceptance)"
+  else
+    die "HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV): reproducibility FAIL. Pin with scripts/checkout.sh --repin; use --allow-tip only for non-acceptance tip builds."
+  fi
+fi
+
+if [ "$CHECK_ONLY" = "1" ]; then
+  log "check-only mode: step 0 passed (read-only); no smoke, no ninja"
+  exit 0
 fi
 
 # ---------------------------------------------------------------- step 1

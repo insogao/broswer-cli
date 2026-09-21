@@ -5,6 +5,13 @@
 #
 # All locations are overridable via environment variables; no machine-specific
 # absolute paths are hardcoded in this repository.
+#
+# Disk policy (two distinct gates, never interchangeable):
+#   DISK_MIN_FRESH_GIB  fresh checkout start gate (default 65 GiB):
+#                       source ~31 GiB + out/Dev ~8 GiB + 25 GiB reserve.
+#                       May be raised, never lowered below DISK_MIN_GIB.
+#   DISK_MIN_GIB        runtime circuit breaker (default 25 GiB):
+#                       always enforced before/during builds; no bypass.
 
 set -euo pipefail
 
@@ -21,6 +28,7 @@ LOG_DIR="${BROWSER_CLI_LOG_DIR:-$BROWSER_CLI_ROOT/build-logs}"
 BUILD_JOBS="${BUILD_JOBS:-6}"
 MAX_JOBS="${MAX_JOBS:-6}"
 DISK_MIN_GIB="${DISK_MIN_GIB:-25}"
+DISK_MIN_FRESH_GIB="${DISK_MIN_FRESH_GIB:-65}"
 DISK_PATH="${DISK_PATH:-/System/Volumes/Data}"
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:10808}"
 NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1}"
@@ -44,6 +52,16 @@ run() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+case "$DISK_MIN_GIB" in
+  ''|*[!0-9]*) die "DISK_MIN_GIB must be an integer number of GiB (got '$DISK_MIN_GIB')" ;;
+esac
+case "$DISK_MIN_FRESH_GIB" in
+  ''|*[!0-9]*) die "DISK_MIN_FRESH_GIB must be an integer number of GiB (got '$DISK_MIN_FRESH_GIB')" ;;
+esac
+if [ "$DISK_MIN_FRESH_GIB" -lt "$DISK_MIN_GIB" ]; then
+  die "DISK_MIN_FRESH_GIB ($DISK_MIN_FRESH_GIB) must be >= DISK_MIN_GIB ($DISK_MIN_GIB); the runtime circuit breaker is never bypassed"
+fi
+
 disk_avail_gib() {
   local target="$DISK_PATH"
   [ -d "$target" ] || target="/"
@@ -54,9 +72,18 @@ require_disk() {
   local avail
   avail="$(disk_avail_gib)"
   if [ "$avail" -lt "$DISK_MIN_GIB" ]; then
-    die "disk gate: ${avail} GiB available (< ${DISK_MIN_GIB} GiB). Stop and report; do not delete user data."
+    die "runtime disk gate: ${avail} GiB available (< ${DISK_MIN_GIB} GiB). Stop and report; do not delete user data."
   fi
-  log "disk gate OK: ${avail} GiB available (min ${DISK_MIN_GIB} GiB)"
+  log "runtime disk gate OK: ${avail} GiB available (min ${DISK_MIN_GIB} GiB)"
+}
+
+require_fresh_disk() {
+  local avail
+  avail="$(disk_avail_gib)"
+  if [ "$avail" -lt "$DISK_MIN_FRESH_GIB" ]; then
+    die "fresh-checkout disk gate: ${avail} GiB available (< ${DISK_MIN_FRESH_GIB} GiB). A fresh checkout needs ~31 GiB source + ~8 GiB out/Dev + ${DISK_MIN_GIB} GiB runtime reserve; do not delete user data."
+  fi
+  log "fresh-checkout disk gate OK: ${avail} GiB available (min ${DISK_MIN_FRESH_GIB} GiB)"
 }
 
 use_depot_tools_python() {
@@ -69,7 +96,8 @@ use_depot_tools_python() {
 }
 
 # Run a network command with explicit proxy injection (never modifies global
-# shell or Git configuration).
+# shell or Git configuration). Every network git/gclient/fetch/curl call in this
+# repository must go through this wrapper.
 with_proxy() {
   env \
     HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \

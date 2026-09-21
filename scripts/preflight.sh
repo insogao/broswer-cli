@@ -19,7 +19,8 @@ Read-only checks for a reproducible Browser CLI build host:
   4. Metal Toolchain installed (Xcode 27 no longer bundles it)
   5. depot_tools + hermetic python3 (python-bin/python3)
   6. Chromium checkout presence (informational on a fresh host) + gn/ninja
-  7. disk gate (default >25 GiB on /System/Volumes/Data)
+  7. disk gates: fresh-checkout start gate (DISK_MIN_FRESH_GIB, default 65 GiB)
+     vs runtime circuit breaker (DISK_MIN_GIB, default 25 GiB)
   8. proxy configuration (PROXY_URL) and optional network probe
   9. single checkout / single out policy
  10. no concurrent fetch/gclient sync
@@ -30,7 +31,7 @@ Options:
   --help           this message
 
 Environment overrides: DEPOT_TOOLS, CHROMIUM_ROOT, OUT_NAME, DISK_MIN_GIB,
-DISK_PATH, PROXY_URL, NO_PROXY_LIST
+DISK_MIN_FRESH_GIB, DISK_PATH, PROXY_URL, NO_PROXY_LIST
 EOF
 }
 
@@ -53,7 +54,9 @@ if [ "$DRY_RUN" = "1" ]; then
   4. Metal Toolchain via \`xcrun -f metal\`
   5. depot_tools + python-bin/python3
   6. Chromium checkout presence (info) + gn/ninja presence
-  7. disk gate: currently $(disk_avail_gib) GiB available (min ${DISK_MIN_GIB} GiB)
+  7. disk gates: fresh checkout start gate (min ${DISK_MIN_FRESH_GIB} GiB) or
+     runtime circuit breaker (min ${DISK_MIN_GIB} GiB) depending on checkout state;
+     currently $(disk_avail_gib) GiB available
   8. proxy: PROXY_URL=${PROXY_URL} (network probe: ${CHECK_NETWORK})
   9. single checkout / single out policy (OUT_NAME=${OUT_NAME})
  10. no concurrent fetch/gclient sync
@@ -117,10 +120,22 @@ else
 fi
 
 AVAIL="$(disk_avail_gib)"
-if [ "$AVAIL" -ge "$DISK_MIN_GIB" ]; then
-  pass "disk: ${AVAIL} GiB available on ${DISK_PATH} (min ${DISK_MIN_GIB} GiB)"
+if [ -d "$CHROMIUM_SRC/.git" ]; then
+  # Existing checkout: the runtime circuit breaker applies to incremental work.
+  if [ "$AVAIL" -ge "$DISK_MIN_GIB" ]; then
+    pass "runtime disk gate: ${AVAIL} GiB available on ${DISK_PATH} (min ${DISK_MIN_GIB} GiB circuit breaker)"
+  else
+    fail "runtime disk: ${AVAIL} GiB available on ${DISK_PATH} (< ${DISK_MIN_GIB} GiB)"
+  fi
+  info "fresh checkout on a new machine would additionally require DISK_MIN_FRESH_GIB=${DISK_MIN_FRESH_GIB} GiB (not needed for this existing checkout)"
 else
-  fail "disk: ${AVAIL} GiB available on ${DISK_PATH} (< ${DISK_MIN_GIB} GiB)"
+  # Fresh host: the higher fresh-checkout start gate applies.
+  if [ "$AVAIL" -ge "$DISK_MIN_FRESH_GIB" ]; then
+    pass "fresh-checkout disk gate: ${AVAIL} GiB available on ${DISK_PATH} (min ${DISK_MIN_FRESH_GIB} GiB)"
+  else
+    fail "fresh-checkout disk: ${AVAIL} GiB available on ${DISK_PATH} (< ${DISK_MIN_FRESH_GIB} GiB; source ~31 GiB + out/Dev ~8 GiB + ${DISK_MIN_GIB} GiB reserve)"
+  fi
+  info "runtime circuit breaker stays at ${DISK_MIN_GIB} GiB after checkout"
 fi
 
 info "proxy: scripts inject PROXY_URL=${PROXY_URL} (ambient proxy env is ignored by design)"
