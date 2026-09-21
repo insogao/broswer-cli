@@ -1,0 +1,7 @@
+# Browser CLI Phase 1: 原版 Chromium 的单一 out/Dev 构建配置。
+# 在 Xcode / checkout / 磁盘门禁满足后用于 /Users/jiangao/dev/chromium/src/out/Dev/args.gn。
+is_debug = false
+is_component_build = true
+symbol_level = 0
+target_cpu = "arm64"
+use_lld = false

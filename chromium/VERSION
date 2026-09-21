@@ -1,0 +1,5 @@
+# Browser CLI verified Chromium revision (Phase 1, verified 2026-09-21).
+# Consumed by scripts/checkout.sh --pin and scripts/preflight.sh.
+revision=7d0f28c30d1c0fadbce17ecec0ee2565aef9a940
+version=156.0.8067.0
+chromium_major=156

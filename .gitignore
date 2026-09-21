@@ -1,0 +1,23 @@
+# 绝不提交 Chromium 源码与构建产物
+/chromium/src/
+**/out/
+src/
+out/
+build-logs/
+*.log
+*.dSYM/
+
+# 本地环境与凭据（不得入库）
+.env
+.env.*
+*.local
+secrets/
+credentials/
+**/Cookies
+**/Login Data
+**/Local State
+**/Profile/
+
+# macOS / 编辑器
+.DS_Store
+*.swp
