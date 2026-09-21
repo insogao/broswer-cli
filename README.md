@@ -80,8 +80,8 @@ scripts/checkout.sh --resume     # 已有固定 checkout：只重跑 revision �
 
 | 门禁 | 默认 | 适用 | 说明 |
 | --- | --- | --- | --- |
-| **新机器启动门禁** `DISK_MIN_FRESH_GIB` | 65 GiB | 全新 checkout 开始前（`checkout.sh` 默认/`--tip`） | 源码 ~31 GiB + `out/Dev` ~8 GiB + 25 GiB 运行保留；可调高，**不可低于 25 GiB** |
-| **运行时熔断** `DISK_MIN_GIB` | 25 GiB | 构建前 + 构建中每 60s | 低于阈值立即终止 ninja；`build.sh` 无任何绕过开关 |
+| **新机器启动门禁** `DISK_MIN_FRESH_GIB` | 65 GiB | 全新 checkout 开始前（`checkout.sh` 默认/`--tip`） | 源码 ~31 GiB + `out/Dev` ~8 GiB + 25 GiB 运行保留；可调高，**不得低于 `DISK_MIN_GIB`** |
+| **运行时熔断** `DISK_MIN_GIB` | 25 GiB | 构建前 + 构建中每 60s | **硬下限 25 GiB：只能调高、不能调低**（低于 25 或试图设为 0 会在任何脚本动作前直接报错）；`build.sh` 无任何绕过开关 |
 
 ## 安全默认值（脚本强制）
 
@@ -90,10 +90,11 @@ scripts/checkout.sh --resume     # 已有固定 checkout：只重跑 revision �
 - **`--no-history`**：shallow checkout，不维护完整 Git history/cache。
 - **代理显式注入**：所有网络 git/gclient/fetch/curl 调用都经 `with_proxy`，不改全局 Git/`.zshrc`。
 - **`-j 6`**：照顾 16 GiB RAM；默认拒绝更高并行度（`--allow-more-jobs` 可显式覆盖）。
-- **25 GiB 运行时熔断（不可绕过）**：构建前检查，构建中每 60s 检查，低于阈值自动终止 ninja。
-- **HEAD 必须等于 pinned revision**：`verify-phase1.sh` 默认对不一致判 FAIL。
+- **25 GiB 运行时熔断（不可绕过）**：构建前检查，构建中每 60s 检查，低于阈值自动终止 ninja；硬下限 25 GiB，环境变量只能调高。
+- **HEAD 必须等于 pinned revision**：`verify-phase1.sh` 默认对不一致判 FAIL；`checkout.sh --resume` 也会在任何网络操作前拒绝 HEAD != VERSION 的 checkout（tip checkout 必须先用 `--repin`）。
 - **depot_tools Python 优先**：规避 Xcode 27 `/usr/bin/python3` shim 与相对 `SDKROOT` 冲突。
 - **不启动可见 UI**：`verify-phase1.sh` 只用二进制的 `--version` 做有界 smoke，不使用 `open`/Dock/Launchpad，不创建窗口。
+- **回归测试**：`tests/run-script-tests.sh` 覆盖语法/help/dry-run、磁盘硬下限负例、watchdog 绕过负例、`--resume` 一致性负例与代理静态审计；不联网、不编译、不启动浏览器。
 
 ## 边界
 

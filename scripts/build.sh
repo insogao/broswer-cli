@@ -24,7 +24,8 @@ Options:
   --help            this message
 
 Environment overrides: CHROMIUM_ROOT, OUT_NAME, BUILD_JOBS, MAX_JOBS,
-DISK_MIN_GIB, DISK_PATH, BROWSER_CLI_LOG_DIR
+DISK_MIN_GIB (hard floor 25 GiB, may only be raised), DISK_PATH,
+BROWSER_CLI_LOG_DIR
 EOF
 }
 

@@ -25,7 +25,8 @@ Phase 1 acceptance for an already-built Chromium checkout. No visible UI.
 Options:
   --dry-run            print the plan without executing it (read-only)
   --check-only         read-only step 0 only: args.gn parity + HEAD == VERSION
-                       revision check, then exit (no smoke, no ninja)
+                       revision check, then exit (no smoke, no ninja; does not
+                       require a built app)
   --allow-tip          opt out of the HEAD == VERSION revision requirement.
                        Only for tip builds; NOT valid for reproducibility
                        acceptance (the default is FAIL on mismatch).
@@ -90,8 +91,10 @@ EOF
 fi
 
 [ -d "$CHROMIUM_SRC/.git" ] || die "no Chromium checkout at $CHROMIUM_SRC (run scripts/checkout.sh)"
-[ -x "$NINJA" ] || die "ninja not found at $NINJA"
-[ -d "$APP_DIR" ] || die "no built app at $APP_DIR (run scripts/build.sh)"
+if [ "$CHECK_ONLY" != "1" ]; then
+  [ -x "$NINJA" ] || die "ninja not found at $NINJA"
+  [ -d "$APP_DIR" ] || die "no built app at $APP_DIR (run scripts/build.sh)"
+fi
 use_depot_tools_python
 
 mkdir -p "$LOG_DIR"
@@ -145,19 +148,17 @@ if [ -z "$PINNED_REV" ]; then
   else
     die "chromium/VERSION has no revision= line; fix it or pass --allow-tip for a non-acceptance tip check"
   fi
-else
+elif [ "$HEAD_REV" = "$PINNED_REV" ]; then
+  note "PASS  checkout HEAD == chromium/VERSION revision ($PINNED_REV)"
+elif [ "$ALLOW_TIP" = "1" ]; then
+  note "WARN  HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV); tip mode allowed (NOT valid for reproducibility acceptance)"
   if git -C "$CHROMIUM_SRC" rev-parse --verify "${PINNED_REV}^{commit}" >/dev/null 2>&1; then
-    note "PASS  chromium/VERSION revision exists in checkout ($PINNED_REV)"
+    note "INFO  pinned revision is also present locally"
   else
-    die "chromium/VERSION revision $PINNED_REV not found in checkout"
+    note "INFO  pinned revision is not present locally (expected for a tip checkout)"
   fi
-  if [ "$HEAD_REV" = "$PINNED_REV" ]; then
-    note "PASS  checkout HEAD == chromium/VERSION revision"
-  elif [ "$ALLOW_TIP" = "1" ]; then
-    note "WARN  HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV); tip mode allowed (NOT valid for reproducibility acceptance)"
-  else
-    die "HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV): reproducibility FAIL. Pin with scripts/checkout.sh --repin; use --allow-tip only for non-acceptance tip builds."
-  fi
+else
+  die "HEAD ($HEAD_REV) != chromium/VERSION ($PINNED_REV): reproducibility FAIL. Pin with scripts/checkout.sh --repin; use --allow-tip only for non-acceptance tip builds."
 fi
 
 if [ "$CHECK_ONLY" = "1" ]; then

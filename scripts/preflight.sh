@@ -30,8 +30,9 @@ Options:
   --check-network  also probe PROXY_URL reachability (HEAD request, no download)
   --help           this message
 
-Environment overrides: DEPOT_TOOLS, CHROMIUM_ROOT, OUT_NAME, DISK_MIN_GIB,
-DISK_MIN_FRESH_GIB, DISK_PATH, PROXY_URL, NO_PROXY_LIST
+Environment overrides: DEPOT_TOOLS, CHROMIUM_ROOT, OUT_NAME,
+DISK_MIN_GIB (hard floor 25 GiB, may only be raised), DISK_MIN_FRESH_GIB
+(>= DISK_MIN_GIB), DISK_PATH, PROXY_URL, NO_PROXY_LIST
 EOF
 }
 

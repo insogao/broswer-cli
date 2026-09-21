@@ -5,17 +5,17 @@
 | 脚本 | 作用 | 关键默认 |
 | --- | --- | --- |
 | `preflight.sh` | 只读环境检查：macOS/arm64、完整 Xcode、SDK、Metal Toolchain、depot_tools python、checkout/gn/ninja、**两种磁盘门禁**、代理、单一 out、并发 fetch | `--check-network` 才做网络探测 |
-| `checkout.sh` | **默认固定 revision**：fetch → `git fetch --depth 1` + `checkout --detach`（经代理）→ `gclient sync --no-history --revision src@<rev>`（经代理）；`--tip` 显式 opt-out（不可复现）；`--resume` 只重跑 revision 匹配依赖同步；`--repin` 把已有 tip checkout 重新固定 | 只建一个 checkout；发现第二个 fetch 立即报错 |
+| `checkout.sh` | **默认固定 revision**：fetch → `git fetch --depth 1` + `checkout --detach`（经代理）→ `gclient sync --no-history --revision src@<rev>`（经代理）；`--tip` 显式 opt-out（不可复现）；`--resume` 只重跑 revision 匹配依赖同步且**要求 HEAD == VERSION（网络操作前检查，否则提示 --repin）**；`--repin` 把已有 tip checkout 重新固定并在 checkout 后与 sync 后**两次核对 HEAD == VERSION** | 只建一个 checkout；发现第二个 fetch 立即报错 |
 | `configure.sh` | 把 `chromium/args.gn` 落到唯一 `out/Dev/args.gn` 并 `gn gen out/Dev` | 其他 out 目录存在即报错；`--force` 才覆盖 args.gn |
 | `build.sh` | `ninja -C out/Dev -j 6 chrome` | 构建前运行时门禁 + **始终开启**的 25 GiB 熔断（无绕过选项）；`--jobs >6` 需显式 `--allow-more-jobs` |
-| `verify-phase1.sh` | Phase 1 无 UI 验收：**HEAD 必须等于 chromium/VERSION revision（默认 FAIL）** + 产物检查 + `--version` smoke + 空跑增量 + 真实 C++ 增量（探针→精确恢复→重编） | `--check-only` 只做只读 revision/args 检查；`--allow-tip` 仅限非验收 tip 构建；不使用 `open`；不使用 `git reset --hard`/`git checkout --` |
+| `verify-phase1.sh` | Phase 1 无 UI 验收：**HEAD 必须等于 chromium/VERSION revision（默认 FAIL）** + 产物检查 + `--version` smoke + 空跑增量 + 真实 C++ 增量（探针→精确恢复→重编） | `--check-only` 只做只读 revision/args 检查（不需要 ninja/App）；`--allow-tip` 仅限非验收 tip 构建；不使用 `open`；不使用 `git reset --hard`/`git checkout --` |
 
 ## 磁盘门禁（两个概念，不可互相替代）
 
 | 变量 | 默认 | 适用场景 |
 | --- | --- | --- |
 | `DISK_MIN_FRESH_GIB` | 65 GiB | 全新 checkout 开始前（`checkout.sh` 默认路径与 `--tip`）。源码 ~31 GiB + `out/Dev` ~8 GiB + 25 GiB 运行保留。可调高，**不得低于 `DISK_MIN_GIB`**（脚本会在加载时直接报错）。 |
-| `DISK_MIN_GIB` | 25 GiB | 运行时熔断：`build.sh` 构建前检查 + 构建中每 60s 检查，低于阈值立即终止 ninja；`--resume`/`--repin` 也用它。**没有绕过开关。** |
+| `DISK_MIN_GIB` | 25 GiB | 运行时熔断：`build.sh` 构建前检查 + 构建中每 60s 检查，低于阈值立即终止 ninja；`--resume`/`--repin` 也用它。**硬下限 25 GiB，只能调高、不能调低**（`DISK_MIN_GIB=24` 或 `0` 会在任何脚本动作前直接报错）。 |
 
 `preflight.sh` 会按当前是否有 checkout 选择对应门禁：新机器看 65 GiB，已有 checkout 看 25 GiB（并提示新机器需求）。
 
@@ -44,6 +44,8 @@ scripts/verify-phase1.sh
 ## 只读自检（不下载/不编译/不启动）
 
 ```sh
+tests/run-script-tests.sh               # 完整回归套件（37 项，见 tests/README.md）
+
 for f in scripts/*.sh scripts/lib/*.sh; do bash -n "$f" || echo "syntax error: $f"; done
 scripts/preflight.sh --dry-run
 scripts/checkout.sh --dry-run           # 默认路径：显示 revision 固定 + revision-aware gclient sync

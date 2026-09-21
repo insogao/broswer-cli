@@ -30,15 +30,18 @@ Options:
   --dry-run  print the exact commands (pinned by default) without executing
   --tip      fetch the current upstream tip instead of chromium/VERSION.
              Explicit opt-out: NOT reproducible, NOT valid for acceptance.
-  --resume   existing checkout: re-run the revision-matched dependency sync
-             (gclient sync --no-history --revision src@<revision>)
+  --resume   existing checkout: re-run the revision-matched dependency sync.
+             Strict: requires HEAD == chromium/VERSION before any network call
+             (tip checkouts must run --repin first).
   --repin    existing tip checkout: fetch + detach the chromium/VERSION
-             revision, then run the revision-matched dependency sync
+             revision, then run the revision-matched dependency sync; HEAD is
+             verified again after checkout and after the sync
   --help     this message
 
 Disk gates:
   fresh checkout (default/--tip): DISK_MIN_FRESH_GIB (default 65 GiB)
-  resume/repin (existing):        DISK_MIN_GIB (default 25 GiB runtime breaker)
+  resume/repin (existing):        DISK_MIN_GIB (default 25 GiB runtime breaker;
+                                  hard floor 25 GiB, may only be raised)
 
 Environment overrides: CHROMIUM_ROOT, DEPOT_TOOLS, PROXY_URL, DISK_MIN_GIB,
 DISK_MIN_FRESH_GIB, DISK_PATH
@@ -133,14 +136,36 @@ if [ "$RESUME" = "1" ] || [ "$REPIN" = "1" ]; then
   require_disk
   [ -d "$CHROMIUM_SRC/.git" ] || die "--resume/--repin need an existing checkout at $CHROMIUM_SRC"
   [ -f "$CHROMIUM_ROOT/.gclient" ] || die "--resume/--repin need $CHROMIUM_ROOT/.gclient (created by scripts/checkout.sh)"
+
+  if [ "$RESUME" = "1" ]; then
+    # Strict consistency before any network operation: resuming a tip checkout
+    # would silently produce "tip main repo + pinned deps".
+    CURRENT_REV="$(checkout_revision || true)"
+    if [ "$CURRENT_REV" != "$REV" ]; then
+      die "--resume requires checkout HEAD == chromium/VERSION ($REV) before the dependency sync, found '${CURRENT_REV:-none}'; run scripts/checkout.sh --repin first"
+    fi
+    log "resume consistency OK: HEAD == chromium/VERSION ($REV)"
+  fi
+
   if [ "$REPIN" = "1" ]; then
     log "pinning existing checkout to $REV"
     run with_proxy git -C "$CHROMIUM_SRC" fetch --depth 1 origin "$REV"
     run git -C "$CHROMIUM_SRC" checkout --detach "$REV"
+    PINNED_HEAD="$(checkout_revision || true)"
+    if [ "$PINNED_HEAD" != "$REV" ]; then
+      die "--repin failed: HEAD after checkout is '${PINNED_HEAD:-none}', expected $REV"
+    fi
+    log "repin consistency OK: HEAD == chromium/VERSION ($REV)"
   fi
+
   log "revision-matched dependency sync: gclient sync --no-history --revision src@$REV"
   ( cd "$CHROMIUM_ROOT" && run with_proxy "$GCLIENT_BIN" sync --no-history --revision "src@$REV" )
-  log "checkout revision: $(checkout_revision)"
+
+  FINAL_REV="$(checkout_revision || true)"
+  if [ "$FINAL_REV" != "$REV" ]; then
+    die "dependency sync left HEAD at '${FINAL_REV:-none}', expected $REV (chromium/VERSION); investigate before building"
+  fi
+  log "final consistency OK: HEAD == chromium/VERSION ($REV)"
   log "next: scripts/configure.sh"
   exit 0
 fi

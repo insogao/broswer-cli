@@ -9,9 +9,10 @@
 # Disk policy (two distinct gates, never interchangeable):
 #   DISK_MIN_FRESH_GIB  fresh checkout start gate (default 65 GiB):
 #                       source ~31 GiB + out/Dev ~8 GiB + 25 GiB reserve.
-#                       May be raised, never lowered below DISK_MIN_GIB.
+#                       May be raised; never below DISK_MIN_GIB.
 #   DISK_MIN_GIB        runtime circuit breaker (default 25 GiB):
-#                       always enforced before/during builds; no bypass.
+#                       always enforced before/during builds. Hard floor 25 GiB:
+#                       may only be raised, never lowered (no bypass).
 
 set -euo pipefail
 
@@ -29,6 +30,9 @@ BUILD_JOBS="${BUILD_JOBS:-6}"
 MAX_JOBS="${MAX_JOBS:-6}"
 DISK_MIN_GIB="${DISK_MIN_GIB:-25}"
 DISK_MIN_FRESH_GIB="${DISK_MIN_FRESH_GIB:-65}"
+# Hard floor for the runtime circuit breaker. Plain assignment on purpose:
+# the environment cannot lower it.
+DISK_MIN_HARD_FLOOR_GIB=25
 DISK_PATH="${DISK_PATH:-/System/Volumes/Data}"
 PROXY_URL="${PROXY_URL:-http://127.0.0.1:10808}"
 NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1}"
@@ -58,6 +62,9 @@ esac
 case "$DISK_MIN_FRESH_GIB" in
   ''|*[!0-9]*) die "DISK_MIN_FRESH_GIB must be an integer number of GiB (got '$DISK_MIN_FRESH_GIB')" ;;
 esac
+if [ "$DISK_MIN_GIB" -lt "$DISK_MIN_HARD_FLOOR_GIB" ]; then
+  die "DISK_MIN_GIB ($DISK_MIN_GIB) is below the hard floor of ${DISK_MIN_HARD_FLOOR_GIB} GiB; the runtime circuit breaker may only be raised, never lowered"
+fi
 if [ "$DISK_MIN_FRESH_GIB" -lt "$DISK_MIN_GIB" ]; then
   die "DISK_MIN_FRESH_GIB ($DISK_MIN_FRESH_GIB) must be >= DISK_MIN_GIB ($DISK_MIN_GIB); the runtime circuit breaker is never bypassed"
 fi
