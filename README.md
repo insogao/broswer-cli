@@ -10,13 +10,14 @@ Chromium revision + Browser CLI patches + GN 配置 + scripts + tests
 
 **不包含 Chromium 源码。** 在另一台 Apple Silicon Mac 上 clone 本仓库后，必须自行重新下载并编译 Chromium（源码约 30+ GiB、构建产物约 8+ GiB），仓库不会、也不应携带这些内容。
 
-## 当前状态（2026-09-21）
+## 当前状态（2026-09-22）
 
 | 阶段 | 状态 |
 | --- | --- |
 | Phase 0 冻结设计 | 完成（设计文档已版本化收录） |
 | Phase 1 原版 Chromium 构建验证 | 首次编译 exit 0、无 UI CLI smoke、空跑增量、真实 C++ 增量均通过；真实可见 App 启动**未做**（需用户明确授权） |
 | Phase 2 BACKGROUND_PRESENTATION | **未开始**；`chromium/patches/` 仅占位说明 |
+| Branding | 浏览器 Logo 源图已由用户确认并入库；尚未生成 `.icns` 或接入 App Bundle |
 
 环境与验收快照见 [`docs/phase1-environment-2026-09-21.md`](docs/phase1-environment-2026-09-21.md)，Xcode 27 踩坑见 [`docs/pitfalls-xcode27.md`](docs/pitfalls-xcode27.md)。
 
@@ -26,6 +27,7 @@ Chromium revision + Browser CLI patches + GN 配置 + scripts + tests
 browser-cli/
 ├── README.md
 ├── .gitignore
+├── assets/branding/         # 用户确认的品牌源资产；尚未接入应用包
 ├── chromium/
 │   ├── VERSION              # 已验证的 Chromium revision / 版本
 │   ├── args.gn              # 与已验收 out/Dev/args.gn 完全一致
