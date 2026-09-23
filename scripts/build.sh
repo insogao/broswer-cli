@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Browser CLI build: ninja -C out/Dev -j 6 chrome with a 25 GiB disk watchdog.
+#
+# After a successful `chrome` build the product app is signed (mandatory,
+# inside-out) with the pinned Developer ID identity and then verified. Any
+# signing/verification failure fails the whole build: there is no ad-hoc
+# fallback and ad-hoc builds are never testable (see AGENTS.md).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,9 +20,15 @@ Runs `ninja -C out/Dev -j 6 chrome` with:
     below the gate (there is no bypass option)
   - depot_tools python3 first on PATH (Xcode 27 shim workaround)
 
+For the `chrome` target the build then runs, in order and with no bypass:
+  scripts/sign-browser-cli.sh     (inside-out Developer ID signing)
+  scripts/verify-signature.sh     (signature acceptance)
+
 Options:
-  --dry-run         print the ninja command without running it
-  --target TARGET   ninja target (default: chrome)
+  --dry-run         print the ninja command and the signing plan without
+                    running anything
+  --target TARGET   ninja target (default: chrome). Non-chrome targets are
+                    unit-test binaries and skip product signing.
   --jobs N          parallel jobs (default 6; >6 requires --allow-more-jobs)
   --allow-more-jobs allow --jobs above MAX_JOBS (default 6)
   --keep-going      pass -k 0 (keep going after failures)
@@ -63,6 +74,12 @@ if [ "$DRY_RUN" = "1" ]; then
   printf '[dry-run] (cd %q && %q' "$CHROMIUM_SRC" "$NINJA"
   printf ' %q' "${NINJA_ARGS[@]}"
   printf ' %q)\n' "$TARGET"
+  if [ "$TARGET" = "chrome" ]; then
+    printf '[dry-run] then (mandatory, no bypass): %q && %q\n' \
+      "$SCRIPT_DIR/sign-browser-cli.sh" "$SCRIPT_DIR/verify-signature.sh"
+  else
+    printf '[dry-run] target %q is not the product app; product signing is skipped\n' "$TARGET"
+  fi
   printf '[dry-run] log dir: %s ; watchdog: always-on (min %s GiB); disk_now=%s GiB\n' \
     "$LOG_DIR" "$DISK_MIN_GIB" "$(disk_avail_gib)"
   printf '[dry-run] nothing executed\n'
@@ -118,4 +135,19 @@ fi
 
 log "build OK: ninja ${NINJA_ARGS[*]} $TARGET"
 tail -1 "$LOG" 2>/dev/null || true
+
+if [ "$TARGET" = "chrome" ]; then
+  load_product_identity
+  log "post-build signing is mandatory: no ad-hoc product builds are testable"
+  if ! "$SCRIPT_DIR/sign-browser-cli.sh"; then
+    die "product signing FAILED; the build must not be used or claimed testable (no ad-hoc fallback)"
+  fi
+  if ! "$SCRIPT_DIR/verify-signature.sh"; then
+    die "signature acceptance FAILED; the build is not usable"
+  fi
+  log "product signed and verified: $PRODUCT_APP_DIR"
+else
+  log "target '$TARGET' is not the product app; product signing/acceptance skipped"
+fi
+
 log "next: scripts/verify-phase1.sh"

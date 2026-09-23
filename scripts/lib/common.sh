@@ -40,6 +40,8 @@ NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1}"
 NINJA="$CHROMIUM_SRC/third_party/ninja/ninja"
 GN="$CHROMIUM_SRC/buildtools/mac/gn"
 
+PRODUCT_IDENTITY_FILE="$BROWSER_CLI_ROOT/config/product-identity.env"
+
 DRY_RUN="${DRY_RUN:-0}"
 
 log()  { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
@@ -55,6 +57,32 @@ run() {
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Load the single versioned product/signing identity source
+# (config/product-identity.env) and fail closed on incomplete values.
+load_product_identity() {
+  [ -f "$PRODUCT_IDENTITY_FILE" ] || die "missing product identity config: $PRODUCT_IDENTITY_FILE"
+  # shellcheck disable=SC1090
+  . "$PRODUCT_IDENTITY_FILE"
+  : "${BROWSER_CLI_PRODUCT_NAME:?product identity: BROWSER_CLI_PRODUCT_NAME is empty}"
+  : "${BROWSER_CLI_BUNDLE_ID:?product identity: BROWSER_CLI_BUNDLE_ID is empty}"
+  : "${BROWSER_CLI_TEAM_ID:?product identity: BROWSER_CLI_TEAM_ID is empty}"
+  : "${BROWSER_CLI_CODESIGN_IDENTITY_SHA1:?product identity: codesign SHA-1 is empty}"
+  : "${BROWSER_CLI_CODESIGN_IDENTITY_NAME:?product identity: codesign name is empty}"
+  if [ "$BROWSER_CLI_CODESIGN_IDENTITY_SHA1" = "-" ]; then
+    die "product identity forbids the ad-hoc identity '-'"
+  fi
+  case "$BROWSER_CLI_CODESIGN_IDENTITY_SHA1" in
+    [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]) : ;;
+    *) die "codesign identity SHA-1 must be 40 uppercase hex chars (got '$BROWSER_CLI_CODESIGN_IDENTITY_SHA1')" ;;
+  esac
+  case "$BROWSER_CLI_CODESIGN_IDENTITY_NAME" in
+    *"($BROWSER_CLI_TEAM_ID)") : ;;
+    *) die "codesign identity name must contain '($BROWSER_CLI_TEAM_ID)' (got '$BROWSER_CLI_CODESIGN_IDENTITY_NAME')" ;;
+  esac
+  PRODUCT_APP_DIR="$OUT_DIR/$BROWSER_CLI_PRODUCT_NAME.app"
+  PRODUCT_APP_BIN="$PRODUCT_APP_DIR/Contents/MacOS/$BROWSER_CLI_PRODUCT_NAME"
+}
 
 case "$DISK_MIN_GIB" in
   ''|*[!0-9]*) die "DISK_MIN_GIB must be an integer number of GiB (got '$DISK_MIN_GIB')" ;;

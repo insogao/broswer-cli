@@ -1,0 +1,2180 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 8f6060d286..9c989a63ca 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1532,6 +1532,7 @@ source_set("core") {
+       ":shutdown_watchdog_mac",
+       "//chrome/app_shim",
+       "//chrome/browser/apps/app_shim",
++      "//chrome/browser/browser_cli:reopen_window_selection",
+       "//chrome/browser/enterprise/connectors/device_trust/key_management/core/mac",
+       "//chrome/browser/mac",
+       "//chrome/browser/mac:impl",
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 349a2f3540..0db2aeba6a 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -42,6 +42,7 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/apps/app_shim/app_shim_termination_manager.h"
+ #include "chrome/browser/apps/platform_apps/app_window_registry_util.h"
++#include "chrome/browser/browser_cli/reopen_window_selection.h"
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browser_process_platform_part.h"
+@@ -151,6 +152,7 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/menus/cocoa/menu_controller.h"
+ #include "ui/native_theme/native_theme.h"
++#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -263,6 +265,80 @@ void LaunchBrowserStartup(Profile* profile) {
+   return browser;
+ }
+ 
++// Browser CLI: presents |browser|'s native window because the user explicitly
++// asked for it (Dock / Launchpad / app reopen). Managed-mode detection and the
++// presentation are both routed through NativeWidgetMacNSWindowHost (inside the
++// ui/views component), so this file never reaches the presentation policy
++// singleton directly and the process keeps exactly one policy state. The
++// presentation is attributed USER_EXPLICIT and grants per-window HUMAN
++// ownership to that one window; no other managed window is unsuppressed, so an
++// agent/extension/web page/session restore can never ride along on the user's
++// action. Returns whether the presentation was applied. In stock (unmanaged)
++// Chromium this is a no-op because the window already showed itself and the
++// check below is false.
++bool PresentBrowserWindowUserExplicitly(BrowserWindowInterface* browser) {
++  if (!views::NativeWidgetMacNSWindowHost::
++          IsBrowserCliManagedPresentationEnabled()) {
++    return false;
++  }
++  if (!browser || !browser->GetWindow()) {
++    return false;
++  }
++  views::NativeWidgetMacNSWindowHost* host =
++      views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++          browser->GetWindow()->GetNativeWindow());
++  if (!host) {
++    return false;
++  }
++  return host->PresentForUserExplicitAction();
++}
++
++// Browser CLI: presents one existing browser window for an explicit user
++// reopen (Dock / Launchpad / app reopen) while managed background presentation
++// keeps every window hidden. Returns true when an existing window was
++// presented; false means the caller should fall back to creating a new window
++// (no reusable window exists, or managed mode is disabled).
++bool PresentExistingBrowserWindowForUserExplicitReopen() {
++  if (!views::NativeWidgetMacNSWindowHost::
++          IsBrowserCliManagedPresentationEnabled()) {
++    return false;
++  }
++
++  // Candidates are collected in creation order (least recently created first),
++  // which is stable and independent of activation history. Windows without a
++  // native host cannot be presented and are skipped.
++  std::vector<BrowserWindowInterface*> browsers;
++  std::vector<browser_cli::ReopenWindowCandidate> candidates;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&browsers, &candidates](BrowserWindowInterface* browser) {
++        if (!browser->GetWindow()) {
++          return true;
++        }
++        views::NativeWidgetMacNSWindowHost* host =
++            views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++                browser->GetWindow()->GetNativeWindow());
++        if (!host) {
++          return true;
++        }
++        browser_cli::ReopenWindowCandidate candidate;
++        const BrowserWindowInterface::Type type = browser->GetType();
++        candidate.is_reusable_browser_window =
++            type != BrowserWindowInterface::TYPE_APP &&
++            type != BrowserWindowInterface::TYPE_DEVTOOLS;
++        candidate.is_user_owned = host->IsUserExplicitOwned();
++        browsers.push_back(browser);
++        candidates.push_back(candidate);
++        return true;
++      },
++      BrowserCollection::Order::kCreation);
++
++  const size_t selected = browser_cli::SelectReopenWindowCandidate(candidates);
++  if (selected == browser_cli::kNoReopenWindow) {
++    return false;
++  }
++  return PresentBrowserWindowUserExplicitly(browsers[selected]);
++}
++
+ // Activates a browser window having the given profile (the last one active) if
+ // possible or creates an empty one if necessary. Returns a pointer to the
+ // activated/new |BrowserWindowInterface|.
+@@ -1857,6 +1933,22 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   if (browser_shutdown::IsTryingToQuit())
+     return NO;
+ 
++  // Browser CLI: clicking the Dock icon / Launchpad / the app icon is an
++  // explicit user request for the browser and must always win over the
++  // background-presentation policy (development plan invariant 5.2).
++  //
++  // The grant is per window: the presented window (an existing background
++  // window when one is reusable, otherwise a newly created one) is attributed
++  // ForegroundOrigin::kUserExplicit and becomes HUMAN-owned; every other
++  // managed window (agent / extension / web page / session restore) stays
++  // suppressed (invariant 5.1). This is deliberately not a process-wide
++  // takeover, and -applicationDidBecomeActive is deliberately not treated as
++  // USER_EXPLICIT (plan section 3).
++  //
++  // TODO(browser-cli/phase3): the profile picker and the hidden-login-item
++  // session restore paths below still rely on upstream behavior and are not
++  // attributed yet; they are tracked as unproven in the phase document.
++
+   // Bring all browser windows to the front. Specifically, this brings them in
+   // front of any app windows. FocusWindowSet will also unminimize the most
+   // recently minimized window if no windows in the set are visible.
+@@ -1879,6 +1971,15 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+     }
+   }
+ 
++  // Browser CLI: with managed background presentation every browser window can
++  // be hidden, so AppKit reports no visible windows above. The explicit user
++  // reopen must present one of the existing windows instead of unconditionally
++  // creating a new one; only when there is no reusable browser window does the
++  // normal new-window path below run. Stock Chromium is unaffected.
++  if (PresentExistingBrowserWindowForUserExplicitReopen()) {
++    return NO;
++  }
++
+   base::FilePath lastProfilePath = GetStartupProfilePathMac();
+   DCHECK_NE(lastProfilePath, ProfileManager::GetSystemProfilePath());
+ 
+@@ -1920,7 +2021,10 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+           if (!profile) {
+             return;
+           }
+-          CreateBrowser(profile);
++          // Browser CLI: the new window was created in background and its
++          // internal show was denied; present it as the explicit user action
++          // that triggered this reopen.
++          PresentBrowserWindowUserExplicitly(CreateBrowser(profile));
+         }),
+         app_controller_mac::kShowProfilePickerOnFailure);
+   }
+diff --git a/chrome/browser/browser_cli/BUILD.gn b/chrome/browser/browser_cli/BUILD.gn
+new file mode 100644
+index 0000000000..8d12e4fc88
+--- /dev/null
++++ b/chrome/browser/browser_cli/BUILD.gn
+@@ -0,0 +1,24 @@
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//testing/test.gni")
++
++source_set("reopen_window_selection") {
++  sources = [
++    "reopen_window_selection.cc",
++    "reopen_window_selection.h",
++  ]
++  deps = [ "//base" ]
++}
++
++test("reopen_window_selection_unittests") {
++  sources = [ "reopen_window_selection_unittest.cc" ]
++  deps = [
++    ":reopen_window_selection",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
+diff --git a/chrome/browser/browser_cli/reopen_window_selection.cc b/chrome/browser/browser_cli/reopen_window_selection.cc
+new file mode 100644
+index 0000000000..e0e9f833ac
+--- /dev/null
++++ b/chrome/browser/browser_cli/reopen_window_selection.cc
+@@ -0,0 +1,28 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/reopen_window_selection.h"
++
++namespace browser_cli {
++
++size_t SelectReopenWindowCandidate(
++    base::span<const ReopenWindowCandidate> candidates) {
++  size_t most_recent_reusable = kNoReopenWindow;
++  size_t most_recent_user_owned = kNoReopenWindow;
++  for (size_t index = 0; index < candidates.size(); ++index) {
++    const ReopenWindowCandidate& candidate = candidates[index];
++    if (!candidate.is_reusable_browser_window) {
++      continue;
++    }
++    // Candidates arrive in creation order, so a later index is more recent.
++    most_recent_reusable = index;
++    if (candidate.is_user_owned) {
++      most_recent_user_owned = index;
++    }
++  }
++  return most_recent_user_owned != kNoReopenWindow ? most_recent_user_owned
++                                                   : most_recent_reusable;
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/reopen_window_selection.h b/chrome/browser/browser_cli/reopen_window_selection.h
+new file mode 100644
+index 0000000000..11eeb56590
+--- /dev/null
++++ b/chrome/browser/browser_cli/reopen_window_selection.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_REOPEN_WINDOW_SELECTION_H_
++#define CHROME_BROWSER_BROWSER_CLI_REOPEN_WINDOW_SELECTION_H_
++
++#include <stddef.h>
++
++#include "base/containers/span.h"
++
++namespace browser_cli {
++
++// One existing browser window that an explicit user reopen (Dock / Launchpad /
++// app reopen) could present while Browser CLI managed background presentation
++// keeps every window hidden.
++//
++// Candidates are supplied in creation order (least recently created first),
++// which is stable and independent of activation history. The macOS app
++// controller fills these fields from BrowserWindowInterface and
++// NativeWidgetMacNSWindowHost.
++struct ReopenWindowCandidate {
++  // The window is a browser window the user can be given on reopen. App
++  // windows (TYPE_APP) are excluded from macOS window focusing as well, and
++  // DevTools windows are not a browser the user asked for.
++  bool is_reusable_browser_window = false;
++  // The window already carries per-window USER_EXPLICIT/HUMAN ownership from an
++  // earlier explicit user action, so it stays the user's window.
++  bool is_user_owned = false;
++};
++
++// Returned when no candidate may be presented and the caller must create a new
++// window instead.
++inline constexpr size_t kNoReopenWindow = static_cast<size_t>(-1);
++
++// Chooses the window to present for an explicit user reopen:
++//   1. non-reusable candidates are ignored;
++//   2. the most recently created user-owned candidate wins: the window the user
++//      explicitly opened before stays theirs;
++//   3. otherwise the most recently created reusable candidate wins;
++//   4. with no selectable candidate, returns kNoReopenWindow so the caller
++//      creates a new window.
++//
++// Pure function by design, so the selection is deterministic and unit-testable.
++size_t SelectReopenWindowCandidate(
++    base::span<const ReopenWindowCandidate> candidates);
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_REOPEN_WINDOW_SELECTION_H_
+diff --git a/chrome/browser/browser_cli/reopen_window_selection_unittest.cc b/chrome/browser/browser_cli/reopen_window_selection_unittest.cc
+new file mode 100644
+index 0000000000..0b12a3a7e0
+--- /dev/null
++++ b/chrome/browser/browser_cli/reopen_window_selection_unittest.cc
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/reopen_window_selection.h"
++
++#include <vector>
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace browser_cli {
++namespace {
++
++ReopenWindowCandidate ReusableCandidate(bool user_owned = false) {
++  ReopenWindowCandidate candidate;
++  candidate.is_reusable_browser_window = true;
++  candidate.is_user_owned = user_owned;
++  return candidate;
++}
++
++ReopenWindowCandidate NonReusableCandidate(bool user_owned = false) {
++  ReopenWindowCandidate candidate;
++  candidate.is_reusable_browser_window = false;
++  candidate.is_user_owned = user_owned;
++  return candidate;
++}
++
++TEST(ReopenWindowSelectionTest, NoCandidatesMeansCreateNewWindow) {
++  const std::vector<ReopenWindowCandidate> candidates;
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), kNoReopenWindow);
++}
++
++TEST(ReopenWindowSelectionTest, OnlyNonReusableCandidatesMeansCreateNewWindow) {
++  const std::vector<ReopenWindowCandidate> candidates = {
++      NonReusableCandidate(), NonReusableCandidate(/*user_owned=*/true)};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), kNoReopenWindow);
++}
++
++TEST(ReopenWindowSelectionTest, SingleReusableCandidateIsSelected) {
++  const std::vector<ReopenWindowCandidate> candidates = {ReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), 0u);
++}
++
++TEST(ReopenWindowSelectionTest, MostRecentlyCreatedReusableCandidateWins) {
++  const std::vector<ReopenWindowCandidate> candidates = {
++      ReusableCandidate(), ReusableCandidate(), ReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), 2u);
++}
++
++TEST(ReopenWindowSelectionTest, NonReusableCandidatesAreSkipped) {
++  const std::vector<ReopenWindowCandidate> trailing_non_reusable = {
++      ReusableCandidate(), NonReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(trailing_non_reusable), 0u);
++
++  const std::vector<ReopenWindowCandidate> leading_non_reusable = {
++      NonReusableCandidate(), ReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(leading_non_reusable), 1u);
++}
++
++TEST(ReopenWindowSelectionTest, UserOwnedCandidateWinsOverNewerCandidates) {
++  const std::vector<ReopenWindowCandidate> candidates = {
++      ReusableCandidate(/*user_owned=*/true), ReusableCandidate(),
++      ReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), 0u);
++}
++
++TEST(ReopenWindowSelectionTest, MostRecentlyCreatedUserOwnedCandidateWins) {
++  const std::vector<ReopenWindowCandidate> candidates = {
++      ReusableCandidate(/*user_owned=*/true), ReusableCandidate(),
++      ReusableCandidate(/*user_owned=*/true), ReusableCandidate()};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), 2u);
++}
++
++TEST(ReopenWindowSelectionTest, UserOwnedNonReusableCandidateIsIgnored) {
++  const std::vector<ReopenWindowCandidate> candidates = {
++      ReusableCandidate(), NonReusableCandidate(/*user_owned=*/true)};
++  EXPECT_EQ(SelectReopenWindowCandidate(candidates), 0u);
++}
++
++}  // namespace
++}  // namespace browser_cli
+diff --git a/chrome/browser/extensions/api/tabs/tabs_api.cc b/chrome/browser/extensions/api/tabs/tabs_api.cc
+index 8599fed2df..e7dceb5199 100644
+--- a/chrome/browser/extensions/api/tabs/tabs_api.cc
++++ b/chrome/browser/extensions/api/tabs/tabs_api.cc
+@@ -79,6 +79,9 @@
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
+ #include "ui/display/screen.h"
++#if BUILDFLAG(IS_MAC)
++#include "ui/views/widget/browser_cli_foreground_origin.h"
++#endif
+ 
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+@@ -993,6 +996,15 @@ ExtensionFunction::ResponseAction WindowsCreateFunction::Run() {
+       windows::Create::Params::Create(args());
+   EXTENSION_FUNCTION_VALIDATE(params);
+ 
++  // Browser CLI: attribute the presentation requests this API makes to the
++  // extension origin; the policy denies focus/minimize/re-show of a window the
++  // user explicitly owns. macOS-only for now: Browser CLI is a macOS product
++  // and other platforms do not compile ui/views into this target.
++#if BUILDFLAG(IS_MAC)
++  views::ScopedForegroundOrigin origin_scope(
++      views::ForegroundOrigin::kExtension);
++#endif
++
+   DCHECK(extension() || source_context_type() == mojom::ContextType::kWebUi ||
+          source_context_type() == mojom::ContextType::kUntrustedWebUi);
+   create_data_ = std::move(params->create_data);
+@@ -1554,6 +1566,15 @@ ExtensionFunction::ResponseAction WindowsUpdateFunction::Run() {
+       windows::Update::Params::Create(args());
+   EXTENSION_FUNCTION_VALIDATE(params);
+ 
++  // Browser CLI: attribute the presentation requests this API makes to the
++  // extension origin; the policy denies focus/minimize/re-show of a window the
++  // user explicitly owns. macOS-only for now: Browser CLI is a macOS product
++  // and other platforms do not compile ui/views into this target.
++#if BUILDFLAG(IS_MAC)
++  views::ScopedForegroundOrigin origin_scope(
++      views::ForegroundOrigin::kExtension);
++#endif
++
+   WindowController* window_controller = nullptr;
+   std::string error;
+   if (!windows_util::GetControllerFromWindowID(
+@@ -2354,12 +2375,41 @@ ExtensionFunction::ResponseAction TabsCreateFunction::Run() {
+ 
+   BrowserWindowCreateParams create_params(BrowserWindowInterface::TYPE_NORMAL,
+                                           *profile_to_use, user_gesture());
++#if BUILDFLAG(IS_MAC)
++  // Browser CLI: `chrome.tabs.create` is an extension automation producer.
++  // CreateBrowserWindow() posts its callback to a later task, after this
++  // stack (and any ScopedForegroundOrigin on it) has unwound. Bind the
++  // extension origin by value so OnBrowserWindowCreatedWithOrigin() can
++  // re-establish the attribution for the Show/Activate/OpenTabInBrowser it
++  // performs. The value crosses the PostTask; the scope does not, so no other
++  // task or window is affected.
++  CreateBrowserWindow(
++      std::move(create_params),
++      base::BindOnce(&TabsCreateFunction::OnBrowserWindowCreatedWithOrigin,
++                     this, views::ForegroundOrigin::kExtension));
++#else
+   CreateBrowserWindow(
+       std::move(create_params),
+       base::BindOnce(&TabsCreateFunction::OnBrowserWindowCreated, this));
++#endif
+   return RespondLater();
+ }
+ 
++#if BUILDFLAG(IS_MAC)
++void TabsCreateFunction::OnBrowserWindowCreatedWithOrigin(
++    views::ForegroundOrigin origin,
++    BrowserWindowInterface* browser) {
++  // Browser CLI: scope only this continuation. Run()'s stack has unwound by
++  // the time the PostTask from CreateBrowserWindow() runs this callback, so
++  // the origin is re-established here. The scope dies with the callback and
++  // never covers another task or another window; a deferred
++  // BrowserView::Show() captures the origin itself and carries it across its
++  // own deferral.
++  views::ScopedForegroundOrigin origin_scope(origin);
++  OnBrowserWindowCreated(browser);
++}
++#endif
++
+ void TabsCreateFunction::OnBrowserWindowCreated(
+     BrowserWindowInterface* browser) {
+   if (!browser) {
+diff --git a/chrome/browser/extensions/api/tabs/tabs_api.h b/chrome/browser/extensions/api/tabs/tabs_api.h
+index 19ed3ed3a9..3ca9acfabb 100644
+--- a/chrome/browser/extensions/api/tabs/tabs_api.h
++++ b/chrome/browser/extensions/api/tabs/tabs_api.h
+@@ -69,6 +69,12 @@ class IsolatedWebAppUrlInfo;
+ }
+ #endif
+ 
++#if BUILDFLAG(IS_MAC)
++namespace views {
++enum class ForegroundOrigin;
++}
++#endif
++
+ namespace extensions {
+ 
+ // This namespace includes a collection of conceptually-internal helper methods
+@@ -318,6 +324,15 @@ class TabsCreateFunction : public ExtensionFunction {
+   // Called after a new browser window has been created.
+   void OnBrowserWindowCreated(BrowserWindowInterface* browser);
+ 
++#if BUILDFLAG(IS_MAC)
++  // Browser CLI: continuation for the asynchronous window-creation path. The
++  // `origin` is bound by value in Run() and therefore survives the PostTask
++  // inside CreateBrowserWindow(); the scope it establishes covers only this
++  // continuation (Show / Activate / OpenTabInBrowser) and unwinds with it.
++  void OnBrowserWindowCreatedWithOrigin(views::ForegroundOrigin origin,
++                                        BrowserWindowInterface* browser);
++#endif
++
+   // Opens a new tab in the given `browser`. If non-null, sets its opener to
+   // `opener_tab`.
+   void OpenTabInBrowser(BrowserWindowInterface& browser,
+diff --git a/chrome/browser/extensions/browser_extension_window_controller.cc b/chrome/browser/extensions/browser_extension_window_controller.cc
+index b48c0452f3..892f0115d3 100644
+--- a/chrome/browser/extensions/browser_extension_window_controller.cc
++++ b/chrome/browser/extensions/browser_extension_window_controller.cc
+@@ -31,6 +31,9 @@
+ #include "ui/base/base_window.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
++#if BUILDFLAG(IS_MAC)
++#include "ui/views/widget/browser_cli_foreground_origin.h"
++#endif
+ 
+ // TODO(http://crbug.com/453008083): Stop including
+ // "android/chrome_feature_list.h".
+@@ -147,6 +150,20 @@ void BrowserExtensionWindowController::SetFullscreenMode(
+   NOTIMPLEMENTED();
+ #else
+   if (window()->IsFullscreen() != is_fullscreen) {
++#if BUILDFLAG(IS_MAC)
++    // Browser CLI: deny automation fullscreen of a HUMAN-owned window before
++    // the fullscreen controller starts its state machine. Leaving the
++    // controller "pending" (its flags are only rolled back on a real window
++    // state change) would corrupt later user-initiated fullscreen sessions.
++    // The widget-level gate in NativeWidgetMac::SetFullscreen stays as a
++    // backstop. The policy entry point is Objective-C-free, so this C++ file
++    // does not need the Cocoa headers of NativeWidgetMacNSWindowHost.
++    if (!views::AllowProgrammaticWindowChangeFromCurrentOrigin(
++            window()->GetNativeWindow(),
++            views::BrowserCliPresentationAction::kFullscreen)) {
++      return;
++    }
++#endif
+     ExclusiveAccessManager::From(&browser_.get())
+         ->fullscreen_controller()
+         ->ToggleBrowserFullscreenModeWithExtension(extension_url);
+diff --git a/chrome/browser/ui/views/frame/browser_view.cc b/chrome/browser/ui/views/frame/browser_view.cc
+index 139101e924..e12ef8178c 100644
+--- a/chrome/browser/ui/views/frame/browser_view.cc
++++ b/chrome/browser/ui/views/frame/browser_view.cc
+@@ -362,6 +362,7 @@
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ #include "ui/views/views_features.h"
++#include "ui/views/widget/browser_cli_foreground_origin.h"
+ #include "ui/views/widget/native_widget.h"
+ #include "ui/views/widget/root_view.h"
+ #include "ui/views/widget/sublevel_manager.h"
+@@ -1604,8 +1605,21 @@ void BrowserView::Show() {
+   }
+ 
+   if (auto* manager = InitialWebUIManager::From(browser())) {
++    // Browser CLI: carry the foreground origin across the deferral. Otherwise a
++    // deferred automation show would be re-attributed as internal and could
++    // still present a HUMAN-owned window. ScopedForegroundOrigin is
++    // thread-local and unwinds with this callback, so the origin is never
++    // persisted to other windows or later tasks.
++    const views::ForegroundOrigin origin = views::CurrentForegroundOrigin();
+     if (manager->RequestDeferShow(base::BindOnce(
+-            &BrowserView::Show, weak_ptr_factory_.GetWeakPtr()))) {
++            [](base::WeakPtr<BrowserView> view,
++               views::ForegroundOrigin origin) {
++              views::ScopedForegroundOrigin origin_scope(origin);
++              if (view) {
++                view->Show();
++              }
++            },
++            weak_ptr_factory_.GetWeakPtr(), origin))) {
+       return;
+     }
+   }
+@@ -1677,6 +1691,18 @@ bool BrowserView::IsVisible() const {
+ }
+ 
+ void BrowserView::SetBounds(const gfx::Rect& bounds) {
++#if BUILDFLAG(IS_MAC)
++  // Browser CLI: programmatic bounds changes (extension windows API) must be
++  // denied on a HUMAN-owned window before any side effect: this method exits
++  // tab fullscreen first. Internal Chrome UI (snap/restore/session) and the
++  // user's native resize stay attributed kInternal and allowed. The policy
++  // lives in the ui/views component; the C++ entry point keeps this file free
++  // of Cocoa headers.
++  if (!views::AllowProgrammaticWindowChangeFromCurrentOrigin(
++          GetNativeWindow(), views::BrowserCliPresentationAction::kSetBounds)) {
++    return;
++  }
++#endif
+   if (BrowserWindowFullscreenController::From(browser())->IsForceFullscreen()) {
+     return;
+   }
+@@ -1709,8 +1735,19 @@ void BrowserView::Activate() {
+   }
+ 
+   if (auto* manager = InitialWebUIManager::From(browser())) {
++    // Browser CLI: carry the foreground origin across the deferral. Otherwise a
++    // deferred automation activation would be re-attributed as internal and
++    // could still focus a HUMAN-owned window.
++    const views::ForegroundOrigin origin = views::CurrentForegroundOrigin();
+     if (manager->RequestDeferShow(base::BindOnce(
+-            &BrowserView::Activate, weak_ptr_factory_.GetWeakPtr()))) {
++            [](base::WeakPtr<BrowserView> view,
++               views::ForegroundOrigin origin) {
++              views::ScopedForegroundOrigin origin_scope(origin);
++              if (view) {
++                view->Activate();
++              }
++            },
++            weak_ptr_factory_.GetWeakPtr(), origin))) {
+       return;
+     }
+   }
+diff --git a/components/remote_cocoa/app_shim/BUILD.gn b/components/remote_cocoa/app_shim/BUILD.gn
+index 8e61a19d40..e1ceb4ba23 100644
+--- a/components/remote_cocoa/app_shim/BUILD.gn
++++ b/components/remote_cocoa/app_shim/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//mojo/public/tools/bindings/mojom.gni")
++import("//testing/test.gni")
+ 
+ config("app_shim_warnings") {
+   if (is_mac) {
+@@ -136,3 +137,18 @@ source_set("unit_tests") {
+     "//ui/display:test_support",
+   ]
+ }
++
++test("browser_cli_managed_presentation_unittests") {
++  sources = [ "browser_cli_managed_presentation_unittests.mm" ]
++
++  deps = [
++    ":app_shim",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++    "//ui/base",
++  ]
++
++  frameworks = [ "Cocoa.framework" ]
++}
+diff --git a/components/remote_cocoa/app_shim/browser_cli_managed_presentation_unittests.mm b/components/remote_cocoa/app_shim/browser_cli_managed_presentation_unittests.mm
+new file mode 100644
+index 0000000000..61e9d49437
+--- /dev/null
++++ b/components/remote_cocoa/app_shim/browser_cli_managed_presentation_unittests.mm
+@@ -0,0 +1,84 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <AppKit/AppKit.h>
++
++#import "components/remote_cocoa/app_shim/native_widget_mac_nswindow.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/base/cocoa/window_size_constants.h"
++
++namespace {
++
++// Browser CLI Phase 2 tests for the AppKit-level managed-window hard stop.
++//
++// The window frame is intentionally far offscreen: if the suppression guard
++// ever regresses, the test would still detect ordering (isVisible becomes YES)
++// without ever putting a window in front of the user. The tests never order
++// the window in while the guard is lifted, so no visible window is created.
++
++NativeWidgetMacNSWindow* CreateTestWindow() {
++  NativeWidgetMacNSWindow* window = [[NativeWidgetMacNSWindow alloc]
++      initWithContentRect:ui::kWindowSizeDeterminedLater
++                styleMask:NSWindowStyleMaskTitled
++                  backing:NSBackingStoreBuffered
++                    defer:NO];
++  [window setFrame:NSMakeRect(-10000, -10000, 100, 100) display:NO];
++  return window;
++}
++
++}  // namespace
++
++TEST(BrowserCliManagedPresentationTest, DefaultsToNotSuppressed) {
++  @autoreleasepool {
++    NativeWidgetMacNSWindow* window = CreateTestWindow();
++    EXPECT_FALSE(window.managedPresentationSuppressed);
++    [window close];
++  }
++}
++
++TEST(BrowserCliManagedPresentationTest,
++     SuppressedWindowIgnoresAllPresentationEntryPoints) {
++  @autoreleasepool {
++    NativeWidgetMacNSWindow* window = CreateTestWindow();
++    window.managedPresentationSuppressed = YES;
++    EXPECT_FALSE([window isVisible]);
++
++    [window orderFront:nil];
++    EXPECT_FALSE([window isVisible]);
++
++    [window orderFrontRegardless];
++    EXPECT_FALSE([window isVisible]);
++
++    [window orderBack:nil];
++    EXPECT_FALSE([window isVisible]);
++
++    [window orderWindow:NSWindowAbove relativeTo:0];
++    EXPECT_FALSE([window isVisible]);
++
++    [window orderWindow:NSWindowBelow relativeTo:0];
++    EXPECT_FALSE([window isVisible]);
++
++    [window makeKeyAndOrderFront:nil];
++    EXPECT_FALSE([window isVisible]);
++
++    [window makeKeyWindow];
++    EXPECT_FALSE([window isKeyWindow]);
++
++    [window miniaturize:nil];
++    EXPECT_FALSE([window isMiniaturized]);
++
++    // Ordering out must stay allowed: it can never make a window visible.
++    [window orderWindow:NSWindowOut relativeTo:0];
++    EXPECT_FALSE([window isVisible]);
++
++    // Lifting the guard restores the default flag state. We deliberately do
++    // not order the window in afterwards (no visible window in tests).
++    window.managedPresentationSuppressed = NO;
++    EXPECT_FALSE(window.managedPresentationSuppressed);
++
++    // Re-arm before closing so teardown cannot order the window in.
++    window.managedPresentationSuppressed = YES;
++    [window close];
++  }
++}
+diff --git a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.h b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.h
+index 48f47bf3ee..ae22ba8d8c 100644
+--- a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.h
++++ b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.h
+@@ -53,6 +53,16 @@ REMOTE_COCOA_APP_SHIM_EXPORT
+ // https://crbug.com/960904
+ - (void)enforceNeverMadeVisible;
+ 
++// Browser CLI Phase 2: while this is YES, the window is a managed background
++// window and native presentation is suppressed at the AppKit boundary:
++// ordering in, key-window acquisition, miniaturization and fullscreen are all
++// rejected (ordering out and closing still work). Unlike
++// -enforceNeverMadeVisible, this is dynamic and can be cleared for an
++// authorized USER_EXPLICIT presentation; see
++// ui/views/widget/browser_cli_presentation_policy.h for the policy that drives
++// it.
++@property(assign, nonatomic) BOOL managedPresentationSuppressed;
++
+ // `- [NSWindow orderWindow:]` does not have any effect when called on child
+ // windows. If you need to order a child window, use this method. Important:
+ // this method adds or removes children from the parent. If you're observing
+diff --git a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
+index 6f02db4063..a3e3455a44 100644
+--- a/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
++++ b/components/remote_cocoa/app_shim/native_widget_mac_nswindow.mm
+@@ -11,6 +11,7 @@
+ #include "base/check.h"
+ #include "base/debug/dump_without_crashing.h"
+ #include "base/feature_list.h"
++#include "base/logging.h"
+ #include "base/mac/mac_util.h"
+ #include "base/memory/raw_ptr_exclusion.h"
+ #include "base/strings/string_number_conversions.h"
+@@ -109,6 +110,19 @@ void OrderChildWindow(NSWindow* child_window,
+   }
+ }
+ 
++// Browser CLI Phase 2: structured log for every presentation request that the
++// AppKit-level managed-window guard swallows. Kept independent of ui/views so
++// the app shim process can use it too.
++void LogManagedPresentationDenied(const char* action,
++                                  NativeWidgetMacNSWindow* window) {
++  const uint64_t widget_id = [window bridgedNativeWidgetId];
++  const NSInteger window_number = [window windowNumber];
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=appkit decision=deny"
++            << " action=" << action << " widget_id=" << widget_id
++            << " window_number=" << window_number
++            << " reason=managed-presentation-suppressed";
++}
++
+ }  // namespace
+ 
+ @interface NSNextStepFrame (Private)
+@@ -222,6 +236,7 @@ @implementation NativeWidgetMacNSWindow {
+   BOOL _willUpdateRestorableState;
+   BOOL _willSaveRestorableStateAfterDelay;
+   BOOL _isEnforcingNeverMadeVisible;
++  BOOL _managedPresentationSuppressed;
+   BOOL _activationIndependence;
+   BOOL _isTooltip;
+   BOOL _isShufflingForOrdering;
+@@ -234,6 +249,7 @@ @implementation NativeWidgetMacNSWindow {
+ @synthesize isTooltip = _isTooltip;
+ @synthesize isShufflingForOrdering = _isShufflingForOrdering;
+ @synthesize preventKeyWindow = _preventKeyWindow;
++@synthesize managedPresentationSuppressed = _managedPresentationSuppressed;
+ @synthesize childWindowAddedHandler = _childWindowAddedHandler;
+ @synthesize childWindowRemovedHandler = _childWindowRemovedHandler;
+ @synthesize commandDispatchParentOverride = _commandDispatchParentOverride;
+@@ -837,6 +853,13 @@ - (bool)activationIndependence {
+ // -orderWindowByShuffling:relativeTo: instead.
+ - (void)orderWindow:(NSWindowOrderingMode)orderingMode
+          relativeTo:(NSInteger)otherWindowNumber {
++  // Browser CLI Phase 2: a managed background window is never ordered in,
++  // regardless of who asks (Chromium, an extension, a page, session restore or
++  // an external framework). Ordering out stays allowed.
++  if (_managedPresentationSuppressed && orderingMode != NSWindowOut) {
++    LogManagedPresentationDenied("order-window", self);
++    return;
++  }
+   // Prevent a window that should never be visible from being ordered in.
+   // External frameworks (e.g., AuthenticationServicesCore presenting
+   // passkey/WebAuthn dialogs) can trigger window ordering on the invisible
+@@ -849,7 +872,59 @@ - (void)orderWindow:(NSWindowOrderingMode)orderingMode
+   [[self viewsNSWindowDelegate] onWindowOrderChanged:nil];
+ }
+ 
++// Browser CLI Phase 2: the remaining AppKit presentation entry points. All of
++// them are no-ops while `managedPresentationSuppressed` is YES and log the
++// attempted action so that every visibility decision can be attributed.
++
++- (void)orderFront:(id)sender {
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("order-front", self);
++    return;
++  }
++  [super orderFront:sender];
++}
++
++- (void)orderBack:(id)sender {
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("order-back", self);
++    return;
++  }
++  [super orderBack:sender];
++}
++
++- (void)orderFrontRegardless {
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("order-front-regardless", self);
++    return;
++  }
++  [super orderFrontRegardless];
++}
++
++- (void)makeKeyWindow {
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("make-key", self);
++    return;
++  }
++  [super makeKeyWindow];
++}
++
++- (void)toggleFullScreen:(id)sender {
++  // Going fullscreen implicitly makes a window visible; never allow that for a
++  // managed background window.
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("fullscreen", self);
++    return;
++  }
++  [super toggleFullScreen:sender];
++}
++
+ - (void)miniaturize:(id)sender {
++  // Browser CLI Phase 2: miniaturizing a managed background window could put
++  // it into the Dock, which is desktop UI. Refuse while suppressed.
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("miniaturize", self);
++    return;
++  }
+   // The miniaturize operation appears to not be "atomic" because of
+   // non-blocking roundtrip IPC with the Dock. We want to note here that
+   // miniaturization is in progress. The process completes when we reach
+@@ -884,6 +959,10 @@ - (void)_regularMinimizeToDock {
+ }
+ 
+ - (void)makeKeyAndOrderFront:(id)sender {
++  if (_managedPresentationSuppressed) {
++    LogManagedPresentationDenied("make-key-and-order-front", self);
++    return;
++  }
+   _miniaturizationInProgress = NO;
+   [super makeKeyAndOrderFront:sender];
+ }
+diff --git a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+index 74e0a36205..70b12dc64e 100644
+--- a/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
++++ b/components/remote_cocoa/app_shim/native_widget_ns_window_bridge.mm
+@@ -912,6 +912,20 @@ NSUInteger CountBridgedWindows(NSArray* child_windows) {
+ 
+ void NativeWidgetNSWindowBridge::SetVisibilityState(
+     WindowVisibilityState new_state) {
++  // Browser CLI Phase 2 backstop: a managed background window never becomes
++  // visible or active, even if a caller reaches the bridge directly (this is
++  // the last Chromium-controlled gateway before AppKit). Hiding stays allowed
++  // so windows can always be torn down or dismissed.
++  if (new_state != WindowVisibilityState::kHideWindow &&
++      [window_ managedPresentationSuppressed]) {
++    const uint64_t widget_id = [window_ bridgedNativeWidgetId];
++    LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=bridge decision=deny"
++              << " action=set-visibility widget_id=" << widget_id
++              << " new_state=" << static_cast<int>(new_state)
++              << " reason=managed-presentation-suppressed";
++    return;
++  }
++
+   // During session restore this method gets called from RestoreTabsToBrowser()
+   // with new_state = kShowAndActivateWindow. We consume restoration data on our
+   // first time through this method so we can use its existence as an
+diff --git a/ui/views/BUILD.gn b/ui/views/BUILD.gn
+index b54fe1b5db..9884907a3f 100644
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -338,6 +338,7 @@ component("views") {
+     "views_switches.h",
+     "widget/any_widget_observer.h",
+     "widget/any_widget_observer_singleton.h",
++    "widget/browser_cli_foreground_origin.h",
+     "widget/drop_helper.h",
+     "widget/native_widget.h",
+     "widget/native_widget_delegate.h",
+@@ -625,6 +626,7 @@ component("views") {
+   defines = [ "VIEWS_IMPLEMENTATION" ]
+ 
+   deps = [
++    ":browser_cli_presentation_policy",
+     "//base:i18n",
+     "//cc/paint",
+     "//components/url_formatter",
+@@ -1065,6 +1067,17 @@ if (is_win || is_mac || is_linux || is_chromeos) {
+   }
+ }
+ 
++source_set("browser_cli_presentation_policy") {
++  sources = [
++    "widget/browser_cli_presentation_policy.cc",
++    "widget/browser_cli_presentation_policy.h",
++  ]
++  deps = [
++    "//base",
++    "//ui/gfx:native_ui_types",
++  ]
++}
++
+ source_set("test_support") {
+   testonly = true
+   sources = [
+@@ -1280,6 +1293,17 @@ source_set("test_support") {
+   configs += [ "//build/config/compiler:no_exit_time_destructors" ]
+ }
+ 
++test("browser_cli_presentation_policy_unittests") {
++  sources = [ "widget/browser_cli_presentation_policy_unittest.cc" ]
++  deps = [
++    ":browser_cli_presentation_policy",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
++
+ test("views_unittests") {
+   use_xvfb = use_xvfb_in_this_config
+ 
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.h b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+index aa953e712e..63f541554f 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.h
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+@@ -31,6 +31,7 @@
+ #include "ui/views/cocoa/native_widget_mac_event_monitor.h"
+ #include "ui/views/view_observer.h"
+ #include "ui/views/views_export.h"
++#include "ui/views/widget/browser_cli_presentation_policy.h"
+ #include "ui/views/widget/widget.h"
+ #include "ui/views/window/dialog_observer.h"
+ 
+@@ -273,7 +274,45 @@ class VIEWS_EXPORT NativeWidgetMacNSWindowHost
+   // space.
+   bool IsVisibleOnScreen() const { return is_visible_ && is_on_active_space_; }
+ 
+-  void SetVisibilityState(remote_cocoa::mojom::WindowVisibilityState new_state);
++  // Browser CLI: whether this window carries per-window USER_EXPLICIT/HUMAN
++  // ownership from an earlier explicit user presentation. Forwarded to the
++  // presentation policy inside this component so callers outside it (for
++  // example the macOS app controller) never touch the policy singleton.
++  bool IsUserExplicitOwned() const;
++
++  // Browser CLI: whether managed background presentation is active for this
++  // process. Implemented inside the ui/views component so callers outside it
++  // (for example the macOS app controller) never need to reach the
++  // BrowserCliPresentationPolicy singleton directly; exactly one policy
++  // instance exists and it lives in this component. Returns false in stock
++  // Chromium.
++  static bool IsBrowserCliManagedPresentationEnabled();
++
++  // Whether the requested native presentation was applied. Returns false when
++  // the Browser CLI background-presentation policy denies the request (the
++  // window stays hidden); hiding is always allowed and returns true. The
++  // request is attributed to CurrentForegroundOrigin() (kInternal unless a
++  // producer scoped it); use PresentForUserExplicitAction() for an explicit
++  // user action.
++  bool SetVisibilityState(remote_cocoa::mojom::WindowVisibilityState new_state);
++
++  // Browser CLI: the explicit-user presentation entry point (Dock / Launchpad /
++  // app reopen / menu bar / CLI explicit `show`). The request is attributed to
++  // ForegroundOrigin::kUserExplicit, which always wins over the background
++  // policy and establishes per-window USER_EXPLICIT/HUMAN ownership for this
++  // widget: this window keeps presenting while every other managed window
++  // stays suppressed. Returns whether the presentation was applied.
++  bool PresentForUserExplicitAction();
++
++  // Browser CLI: policy check for a programmatic window-state change that
++  // arrives through ui::BaseWindow (the extension windows API). Activation is
++  // gated by SetVisibilityState(); minimize, restore, maximize, deactivate,
++  // fullscreen and programmatic bounds changes call this. The user's native
++  // window operations (traffic-light buttons, Window menu, AppKit fullscreen)
++  // do not come through here. Returns whether the caller may proceed; on
++  // denial the AppKit guard is re-armed only for windows the user does not own.
++  bool AllowProgrammaticChangeFromCurrentOrigin(
++      BrowserCliPresentationAction action);
+ 
+   // Add a NSEvent local event monitor, which will send events to `client`
+   // before they are dispatched to their ordinary target. Clients may specify
+@@ -306,6 +345,21 @@ class VIEWS_EXPORT NativeWidgetMacNSWindowHost
+   friend class TextInputHost;
+   friend class views::test::BridgedNativeWidgetTestApi;
+ 
++  // Shared implementation of SetVisibilityState() and
++  // PresentForUserExplicitAction() with explicit foreground attribution. The
++  // policy decides before anything touches AppKit; see
++  // ui/views/widget/browser_cli_presentation_policy.h.
++  bool ApplyVisibilityState(
++      remote_cocoa::mojom::WindowVisibilityState new_state,
++      ForegroundOrigin origin);
++
++  // Runs the presentation policy for one request and logs a host-level denial.
++  // On denial, re-arms the AppKit guard for windows the user does not own (a
++  // HUMAN-owned window must stay unsuppressed so the user's own native
++  // operations keep working).
++  bool EvaluatePresentationRequest(BrowserCliPresentationAction action,
++                                   ForegroundOrigin origin);
++
+   void UpdateCompositorProperties();
+   void DestroyCompositor();
+ 
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.mm b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+index d870fd3cf6..3af7d92464 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.mm
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+@@ -58,6 +58,7 @@
+ #include "ui/views/view_utils.h"
+ #include "ui/views/views_delegate.h"
+ #include "ui/views/views_features.h"
++#include "ui/views/widget/browser_cli_presentation_policy.h"
+ #include "ui/views/widget/native_widget_mac.h"
+ #include "ui/views/widget/widget.h"
+ #include "ui/views/widget/widget_activation_delegate.h"
+@@ -329,6 +330,13 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+ 
+ NativeWidgetMacNSWindowHost::~NativeWidgetMacNSWindowHost() {
+   DCHECK(children_.empty());
++
++  // Browser CLI: drop any per-window USER_EXPLICIT/HUMAN ownership together
++  // with the widget id. A destroyed window must never keep authorizing
++  // presentation for a reused or stale id.
++  BrowserCliPresentationPolicy::Get()->ReleaseUserExplicitOwnership(
++      widget_id_, "window-destroyed");
++
+   native_window_mapping_.reset();
+   if (application_host_) {
+     remote_ns_window_remote_.reset();
+@@ -413,6 +421,16 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+       std::make_unique<remote_cocoa::NativeWidgetNSWindowBridge>(
+           widget_id_, this, this, text_input_host_.get());
+   in_process_ns_window_bridge_->SetWindow(in_process_ns_window_);
++
++  // Browser CLI Phase 2: a window born in managed background mode starts with
++  // native presentation suppressed, so it cannot appear even for an instant.
++  // The policy lifts this only for an authorized presentation.
++  if (BrowserCliPresentationPolicy::Get()->IsManagedModeEnabled()) {
++    in_process_ns_window_.managedPresentationSuppressed = YES;
++    LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=host decision=suppress"
++              << " action=window-created widget_id=" << widget_id_
++              << " reason=managed-mode-at-creation";
++  }
+ }
+ 
+ void NativeWidgetMacNSWindowHost::CreateRemoteNSWindow(
+@@ -888,8 +906,98 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+   return is_window_key_;
+ }
+ 
+-void NativeWidgetMacNSWindowHost::SetVisibilityState(
++// static
++bool NativeWidgetMacNSWindowHost::IsBrowserCliManagedPresentationEnabled() {
++  return BrowserCliPresentationPolicy::Get()->IsManagedModeEnabled();
++}
++
++bool NativeWidgetMacNSWindowHost::IsUserExplicitOwned() const {
++  return BrowserCliPresentationPolicy::Get()->IsUserExplicitOwned(widget_id_);
++}
++
++bool NativeWidgetMacNSWindowHost::SetVisibilityState(
+     remote_cocoa::mojom::WindowVisibilityState new_state) {
++  // Browser CLI: requests that are not explicitly attributed by a producer are
++  // attributed to the current scope (kInternal by default).
++  return ApplyVisibilityState(new_state, CurrentForegroundOrigin());
++}
++
++bool NativeWidgetMacNSWindowHost::PresentForUserExplicitAction() {
++  return ApplyVisibilityState(WindowVisibilityState::kShowAndActivateWindow,
++                              ForegroundOrigin::kUserExplicit);
++}
++
++bool NativeWidgetMacNSWindowHost::AllowProgrammaticChangeFromCurrentOrigin(
++    BrowserCliPresentationAction action) {
++  return EvaluatePresentationRequest(action, CurrentForegroundOrigin());
++}
++
++// Objective-C-free policy entry point declared in
++// ui/views/widget/browser_cli_presentation_policy.h. Defined here inside the
++// ui/views component so C++ (non-Objective-C++) callers such as
++// BrowserView::SetBounds() and BrowserExtensionWindowController can apply the
++// per-window policy without including Cocoa headers.
++bool AllowProgrammaticWindowChangeFromCurrentOrigin(
++    gfx::NativeWindow native_window,
++    BrowserCliPresentationAction action) {
++  auto* host = NativeWidgetMacNSWindowHost::GetFromNativeWindow(native_window);
++  return !host || host->AllowProgrammaticChangeFromCurrentOrigin(action);
++}
++
++bool NativeWidgetMacNSWindowHost::EvaluatePresentationRequest(
++    BrowserCliPresentationAction action,
++    ForegroundOrigin origin) {
++  if (BrowserCliPresentationPolicy::Get()->AllowPresentation(origin, action,
++                                                             widget_id_)) {
++    return true;
++  }
++  // Re-assert the AppKit-level hard stop only for windows the user does not
++  // own: a HUMAN-owned window must stay unsuppressed so the user's native
++  // minimize button and Dock raise keep working.
++  if (in_process_ns_window_ && !IsUserExplicitOwned()) {
++    in_process_ns_window_.managedPresentationSuppressed = YES;
++  }
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=host decision=deny"
++            << " action=" << static_cast<int>(action)
++            << " widget_id=" << widget_id_ << " reason=policy-denied";
++  return false;
++}
++
++bool NativeWidgetMacNSWindowHost::ApplyVisibilityState(
++    remote_cocoa::mojom::WindowVisibilityState new_state,
++    ForegroundOrigin origin) {
++  // Browser CLI Phase 2/3: the single UI-side gateway for native presentation
++  // on macOS. Show / show-inactive / minimize requests are checked against the
++  // foreground policy before any AppKit call is made. A denial never touches
++  // the native window, so there is no "show then hide".
++  //
++  // The decision is per window and per origin: unowned managed windows stay
++  // suppressed; a HUMAN-owned window keeps answering internal requests while
++  // automation origins are denied.
++  const bool requests_presentation =
++      new_state == WindowVisibilityState::kShowAndActivateWindow ||
++      new_state == WindowVisibilityState::kShowInactive;
++  const bool requests_minimize =
++      new_state == WindowVisibilityState::kMiniaturizeWindow;
++  if (requests_presentation || requests_minimize) {
++    const BrowserCliPresentationAction action =
++        requests_presentation
++            ? (new_state == WindowVisibilityState::kShowAndActivateWindow
++                   ? BrowserCliPresentationAction::kShowAndActivate
++                   : BrowserCliPresentationAction::kShowInactive)
++            : BrowserCliPresentationAction::kMinimize;
++    if (!EvaluatePresentationRequest(action, origin)) {
++      return false;
++    }
++    if (in_process_ns_window_) {
++      // Authorized presentation: this is either an explicit user action or a
++      // window the user already owns. Let the native window through; the
++      // AppKit guard is re-armed if the policy later denies presentation
++      // again.
++      in_process_ns_window_.managedPresentationSuppressed = NO;
++    }
++  }
++
+   // On macOS 14 an application can't generally activate themselves. If we're
+   // trying to activate a window in a remote application host, this yield
+   // should make sure this works as long as chrome is the currently active
+@@ -909,6 +1017,7 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+         GetWidget(),
+         new_state == WindowVisibilityState::kShowAndActivateWindow);
+   }
++  return true;
+ }
+ 
+ void NativeWidgetMacNSWindowHost::GetAttachedNativeViewHostViewsRecursive(
+@@ -1786,8 +1895,9 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+ 
+   if (::features::IsAccessibilityRemoteUIAppEnabled()) {
+     pid_t client_pid = [remote_view_accessible_ processIdentifier];
+-    if ([element_id respondsToSelector:@selector
+-                    (accessibilitySetPresenterProcessIdentifier:)]) {
++    if ([element_id
++            respondsToSelector:
++                @selector(accessibilitySetPresenterProcessIdentifier:)]) {
+       [element_id accessibilitySetPresenterProcessIdentifier:client_pid];
+     }
+   }
+diff --git a/ui/views/widget/browser_cli_foreground_origin.h b/ui/views/widget/browser_cli_foreground_origin.h
+new file mode 100644
+index 0000000000..f18ef0f24b
+--- /dev/null
++++ b/ui/views/widget/browser_cli_foreground_origin.h
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_ORIGIN_H_
++#define UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_ORIGIN_H_
++
++// Chrome-facing include for attributing presentation requests to a foreground
++// origin. The origin vocabulary, the policy singleton and the thread-local
++// attribution state all live inside the ui/views component, so there is exactly
++// one of each per process even though callers outside ui/views only link the
++// component (never the policy implementation target).
++//
++// Usage from an automation producer, for example the extension windows API:
++//
++//   views::ScopedForegroundOrigin scope(views::ForegroundOrigin::kExtension);
++//   browser_window->Activate();  // attributed kExtension for this call
++//
++// The scope only attributes the request; the policy still decides. Automation
++// is denied on a HUMAN-owned window, and every action except bounds changes is
++// denied on an unowned background window. `PresentForUserExplicitAction()` is
++// never affected by a scope.
++#include "ui/views/widget/browser_cli_presentation_policy.h"
++
++#endif  // UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_ORIGIN_H_
+diff --git a/ui/views/widget/browser_cli_presentation_policy.cc b/ui/views/widget/browser_cli_presentation_policy.cc
+new file mode 100644
+index 0000000000..79407fc665
+--- /dev/null
++++ b/ui/views/widget/browser_cli_presentation_policy.cc
+@@ -0,0 +1,276 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/views/widget/browser_cli_presentation_policy.h"
++
++#include "base/command_line.h"
++#include "base/logging.h"
++#include "base/no_destructor.h"
++
++namespace views {
++namespace {
++
++const char* OriginToString(ForegroundOrigin origin) {
++  switch (origin) {
++    case ForegroundOrigin::kUserExplicit:
++      return "user-explicit";
++    case ForegroundOrigin::kAgentAssist:
++      return "agent-assist";
++    case ForegroundOrigin::kExtension:
++      return "extension";
++    case ForegroundOrigin::kWebPage:
++      return "web-page";
++    case ForegroundOrigin::kInternal:
++      return "internal";
++    case ForegroundOrigin::kSessionRestore:
++      return "session-restore";
++  }
++}
++
++const char* ActionToString(BrowserCliPresentationAction action) {
++  switch (action) {
++    case BrowserCliPresentationAction::kShowAndActivate:
++      return "show-and-activate";
++    case BrowserCliPresentationAction::kShowInactive:
++      return "show-inactive";
++    case BrowserCliPresentationAction::kMinimize:
++      return "minimize";
++    case BrowserCliPresentationAction::kMaximize:
++      return "maximize";
++    case BrowserCliPresentationAction::kRestore:
++      return "restore";
++    case BrowserCliPresentationAction::kDeactivate:
++      return "deactivate";
++    case BrowserCliPresentationAction::kFullscreen:
++      return "fullscreen";
++    case BrowserCliPresentationAction::kSetBounds:
++      return "set-bounds";
++    case BrowserCliPresentationAction::kSetZOrder:
++      return "set-z-order";
++  }
++}
++
++const char* StateToString(BrowserCliPresentationState state) {
++  switch (state) {
++    case BrowserCliPresentationState::kUnmanaged:
++      return "unmanaged";
++    case BrowserCliPresentationState::kBackground:
++      return "background";
++    case BrowserCliPresentationState::kHuman:
++      return "human";
++  }
++}
++
++// Automation origins may never act on a window the user explicitly owns
++// (invariant 5.3). `kInternal` is deliberately not an automation origin: it is
++// the un-attributed catch-all used by Chrome UI and native user flows.
++bool IsAutomationOrigin(ForegroundOrigin origin) {
++  switch (origin) {
++    case ForegroundOrigin::kAgentAssist:
++    case ForegroundOrigin::kExtension:
++    case ForegroundOrigin::kWebPage:
++    case ForegroundOrigin::kSessionRestore:
++      return true;
++    case ForegroundOrigin::kUserExplicit:
++    case ForegroundOrigin::kInternal:
++      return false;
++  }
++}
++
++// The origin attributed to presentation requests on the current thread.
++// Deliberately a single thread-local in this component: producers outside it
++// only see the scoped setter, so there is exactly one policy and one
++// attribution state per process.
++thread_local ForegroundOrigin g_current_foreground_origin =
++    ForegroundOrigin::kInternal;
++
++}  // namespace
++
++ForegroundOrigin CurrentForegroundOrigin() {
++  return g_current_foreground_origin;
++}
++
++ScopedForegroundOrigin::ScopedForegroundOrigin(ForegroundOrigin origin)
++    : previous_(g_current_foreground_origin) {
++  g_current_foreground_origin = origin;
++}
++
++ScopedForegroundOrigin::~ScopedForegroundOrigin() {
++  g_current_foreground_origin = previous_;
++}
++
++// static
++BrowserCliPresentationPolicy* BrowserCliPresentationPolicy::Get() {
++  static base::NoDestructor<BrowserCliPresentationPolicy> instance;
++  return instance.get();
++}
++
++BrowserCliPresentationPolicy::BrowserCliPresentationPolicy() = default;
++BrowserCliPresentationPolicy::~BrowserCliPresentationPolicy() = default;
++
++bool BrowserCliPresentationPolicy::IsManagedModeEnabled() {
++  EnsureInitializedFromCommandLine();
++  return managed_mode_enabled_;
++}
++
++void BrowserCliPresentationPolicy::EnsureInitializedFromCommandLine() {
++  if (initialized_) {
++    return;
++  }
++  initialized_ = true;
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (!command_line->HasSwitch(kBrowserCliBackgroundPresentationSwitch)) {
++    return;
++  }
++  managed_mode_enabled_ = true;
++  state_ = BrowserCliPresentationState::kBackground;
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy transition=background"
++            << " reason=command-line-switch window_id=0";
++}
++
++bool BrowserCliPresentationPolicy::AllowPresentation(
++    ForegroundOrigin origin,
++    BrowserCliPresentationAction action,
++    uint64_t window_id) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return true;
++  }
++
++  bool allow = false;
++  const char* reason = nullptr;
++  bool newly_owned = false;
++  const bool owned = user_explicit_owned_window_ids_.count(window_id) > 0;
++  if (origin == ForegroundOrigin::kUserExplicit) {
++    // Invariant 5.2: explicit user actions always win. Ownership is granted
++    // per window, never process-wide (invariant 5.1 stays intact for every
++    // other window).
++    allow = true;
++    reason = "user-explicit-always-allowed";
++    if (window_id != 0) {
++      newly_owned = user_explicit_owned_window_ids_.insert(window_id).second;
++    }
++  } else if (owned && IsAutomationOrigin(origin)) {
++    // Invariant 5.3: the user's window is never shown, hidden, minimized,
++    // restored, maximized, fullscreened, deactivated, moved or resized by
++    // automation.
++    allow = false;
++    reason = "human-owned-window-automation-denied";
++  } else if (owned) {
++    // Chrome UI and native user flows that cannot be attributed further stay
++    // allowed on the user's own window.
++    allow = true;
++    reason = "human-owned-window-internal-allowed";
++  } else if (action == BrowserCliPresentationAction::kSetBounds) {
++    // Proven non-presenting for a hidden managed window: the macOS chain
++    // (BrowserView::SetBounds -> Widget::SetBounds ->
++    // NativeWidgetMac::SetBounds -> host SetBoundsInScreen -> bridge
++    // SetBounds) only calls
++    // -[NSWindow setFrame:display:animate:] plus a key-window-guarded
++    // reactivation that the per-window suppression backstop rejects. Chrome's
++    // own layout/restore and background automation need to arrange windows, so
++    // this single action stays allowed on unowned windows.
++    allow = true;
++    reason = "background-bounds-change-never-presents";
++  } else {
++    // Every other action is denied on an unowned window: Restore / Maximize /
++    // Fullscreen / SetZOrder can implicitly show or re-order a hidden window,
++    // so they must not be allowed in the background for any origin.
++    allow = false;
++    reason = "background-suppresses-native-presentation";
++  }
++
++  if (newly_owned) {
++    LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++              << " transition=human-ownership-granted"
++              << " window_id=" << window_id
++              << " owned_windows=" << user_explicit_owned_window_ids_.size()
++              << " reason=user-explicit-presentation";
++  }
++
++  // Keep the Gate A "no internal allow in background" contract exact and the
++  // logs quiet: the only allow an unowned window can produce is the
++  // non-presenting bounds change, which is not a policy decision worth logging
++  // when it is un-attributed (window creation/layout/session restore).
++  // Denials and every automation decision are always logged.
++  const bool owned_after = owned || newly_owned;
++  const bool quiet_allow = allow &&
++                           action == BrowserCliPresentationAction::kSetBounds &&
++                           !owned_after && !IsAutomationOrigin(origin);
++  if (!quiet_allow) {
++    LogDecision(origin, action, window_id, /*owned=*/owned_after, allow,
++                reason);
++  }
++  return allow;
++}
++
++void BrowserCliPresentationPolicy::ReleaseUserExplicitOwnership(
++    uint64_t window_id,
++    const char* reason) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return;
++  }
++  if (user_explicit_owned_window_ids_.erase(window_id) == 0) {
++    return;
++  }
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++            << " transition=human-ownership-released"
++            << " window_id=" << window_id
++            << " owned_windows=" << user_explicit_owned_window_ids_.size()
++            << " reason=" << reason;
++}
++
++bool BrowserCliPresentationPolicy::IsUserExplicitOwned(
++    uint64_t window_id) const {
++  return user_explicit_owned_window_ids_.count(window_id) > 0;
++}
++
++void BrowserCliPresentationPolicy::ResetForTesting() {
++  initialized_ = false;
++  managed_mode_enabled_ = false;
++  state_ = BrowserCliPresentationState::kUnmanaged;
++  decision_count_ = 0;
++  user_explicit_owned_window_ids_.clear();
++  g_current_foreground_origin = ForegroundOrigin::kInternal;
++}
++
++void BrowserCliPresentationPolicy::SetManagedModeEnabledForTesting(
++    bool enabled) {
++  initialized_ = true;
++  managed_mode_enabled_ = enabled;
++  state_ = enabled ? BrowserCliPresentationState::kBackground
++                   : BrowserCliPresentationState::kUnmanaged;
++  user_explicit_owned_window_ids_.clear();
++}
++
++void BrowserCliPresentationPolicy::LogDecision(
++    ForegroundOrigin origin,
++    BrowserCliPresentationAction action,
++    uint64_t window_id,
++    bool owned,
++    bool allow,
++    const char* reason) {
++  // `state=` describes the window the decision is about: a USER_EXPLICIT-owned
++  // window is `human` even though the browser mode stays `background`. This
++  // keeps "no internal allow in background" assertions precise.
++  const BrowserCliPresentationState window_state =
++      state_ == BrowserCliPresentationState::kBackground && owned
++          ? BrowserCliPresentationState::kHuman
++          : state_;
++  ++decision_count_;
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++            << " seq=" << decision_count_
++            << " decision=" << (allow ? "allow" : "deny")
++            << " action=" << ActionToString(action)
++            << " origin=" << OriginToString(origin)
++            << " window_id=" << window_id
++            << " state=" << StateToString(window_state)
++            << " owned=" << (owned ? "yes" : "no")
++            << " owned_windows=" << user_explicit_owned_window_ids_.size()
++            << " reason=" << reason;
++}
++
++}  // namespace views
+diff --git a/ui/views/widget/browser_cli_presentation_policy.h b/ui/views/widget/browser_cli_presentation_policy.h
+new file mode 100644
+index 0000000000..4e2f6bdae8
+--- /dev/null
++++ b/ui/views/widget/browser_cli_presentation_policy.h
+@@ -0,0 +1,221 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_WIDGET_BROWSER_CLI_PRESENTATION_POLICY_H_
++#define UI_VIEWS_WIDGET_BROWSER_CLI_PRESENTATION_POLICY_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <set>
++
++#include "base/no_destructor.h"
++#include "ui/gfx/native_ui_types.h"
++#include "ui/views/views_export.h"
++
++namespace views {
++
++// Browser CLI foreground attribution and window-presentation policy.
++//
++// This is the single decision point for "may this window become natively
++// visible / active" (docs/browser-cli-development-plan.md sections 3-6):
++//
++//   * background-origin presentation must never reach the desktop;
++//   * explicit user actions always win (invariant 5.2);
++//   * ownership is per window: a USER_EXPLICIT presentation marks that one
++//     window as HUMAN-owned (invariant 5.1);
++//   * a HUMAN-owned window is never shown, hidden, minimized, restored,
++//     maximized, fullscreened, deactivated, moved, resized or re-ordered by an
++//     automation origin (agent assist / extension / web page / session
++//     restore), while un-attributed Chrome-internal requests stay allowed so
++//     native user flows and AppKit window controls keep working (invariant
++//     5.3). A user takeover never becomes a process-wide allow;
++//   * an unowned window stays suppressed for every non-user origin. The only
++//     exception is a programmatic bounds change (kSetBounds), which is proven
++//     not to present a hidden window on macOS (see AllowPresentation).
++//
++// The policy is inert unless the command line contains
++// `--browser-cli-background-presentation`, so stock Chromium behavior is
++// unchanged.
++//
++// TODO(browser-cli/phase3): kAgentAssist still has no producer; and some
++// automation entry points cannot be attributed safely yet (see the phase
++// document): `BrowserWebContentsDelegate::ActivateContents` is shared between
++// renderer/CDP activation and user-benefiting Chrome features, and session
++// restore shows windows through the app-shim bridge, below this policy.
++//
++// All methods must be called on the browser UI thread.
++
++// Command-line switch that enables managed background presentation.
++inline constexpr char kBrowserCliBackgroundPresentationSwitch[] =
++    "browser-cli-background-presentation";
++
++// Minimal, extensible foreground attribution model (development plan
++// section 3). Values are stable model vocabulary; adding a producer for an
++// existing value must not change how the other origins are treated.
++enum class ForegroundOrigin {
++  // Dock / Launchpad / app reopen / menu bar / CLI explicit `show`.
++  kUserExplicit,
++  // Reserved (Phase 4): requestForeground for login / captcha / confirmation.
++  kAgentAssist,
++  // `chrome.windows.create/update` automation.
++  kExtension,
++  // Renderer-requested presentation (`window.open` focus, windowing controls).
++  kWebPage,
++  // Browser-internal maintenance, capture, recovery and Chrome UI.
++  kInternal,
++  // Session restore.
++  kSessionRestore,
++};
++
++// The foreground origin attributed to presentation requests made on the
++// current thread. Defaults to ForegroundOrigin::kInternal. Producers that can
++// be attributed safely wrap their synchronous browser-window request with
++// ScopedForegroundOrigin; the state lives inside the ui/views component so
++// that the single BrowserCliPresentationPolicy instance observes it.
++VIEWS_EXPORT ForegroundOrigin CurrentForegroundOrigin();
++
++// Scopes the origin of presentation requests issued while this object is
++// alive. Thread-local, not copyable, and nestable (the previous value is
++// restored on destruction). Producers use this to attribute automation
++// requests so the policy can keep them away from a HUMAN-owned window.
++class VIEWS_EXPORT ScopedForegroundOrigin {
++ public:
++  explicit ScopedForegroundOrigin(ForegroundOrigin origin);
++  ~ScopedForegroundOrigin();
++
++  ScopedForegroundOrigin(const ScopedForegroundOrigin&) = delete;
++  ScopedForegroundOrigin& operator=(const ScopedForegroundOrigin&) = delete;
++
++ private:
++  const ForegroundOrigin previous_;
++};
++
++// Native presentation and programmatic window-state requests that are subject
++// to the policy. The first three reach the native visibility gateway
++// (SetVisibilityState); the others are ui::BaseWindow state changes that can
++// still implicitly show or re-order a hidden window (restore, maximize,
++// fullscreen, z-order), so they are denied for automation on HUMAN-owned
++// windows and denied altogether on unowned windows except kSetBounds, which is
++// proven non-presenting.
++enum class BrowserCliPresentationAction {
++  kShowAndActivate,
++  kShowInactive,
++  kMinimize,
++  kMaximize,
++  kRestore,
++  kDeactivate,
++  kFullscreen,
++  kSetBounds,
++  kSetZOrder,
++};
++
++// Objective-C-free entry point to the per-window programmatic-change policy for
++// C++ translation units that cannot include the Cocoa headers of
++// NativeWidgetMacNSWindowHost. Implemented inside the ui/views component.
++// Returns true when `native_window` has no views host (stock behavior) and
++// otherwise forwards to
++// NativeWidgetMacNSWindowHost::AllowProgrammaticChangeFromCurrentOrigin().
++VIEWS_EXPORT bool AllowProgrammaticWindowChangeFromCurrentOrigin(
++    gfx::NativeWindow native_window,
++    BrowserCliPresentationAction action);
++
++enum class BrowserCliPresentationState {
++  // No switch: stock Chromium behavior, every request is allowed.
++  kUnmanaged,
++  // Managed background: user-explicit requests always present. Windows the
++  // user owns additionally answer internal requests, while automation origins
++  // stay denied.
++  kBackground,
++  // Per-window USER_EXPLICIT/HUMAN ownership of the window a decision is
++  // about. This state is never applied process-wide: a `kHuman` window does
++  // not authorize any other window to present. Reported in decision logs via
++  // `state=`; use IsUserExplicitOwned() to query it for a window id.
++  kHuman,
++};
++
++class VIEWS_EXPORT BrowserCliPresentationPolicy {
++ public:
++  // Always returns the process-wide instance.
++  static BrowserCliPresentationPolicy* Get();
++
++  BrowserCliPresentationPolicy(const BrowserCliPresentationPolicy&) = delete;
++  BrowserCliPresentationPolicy& operator=(const BrowserCliPresentationPolicy&) =
++      delete;
++
++  // Reads the command-line switch on first use; cheap afterwards. Exposed so
++  // UI code can tag windows as managed at creation time.
++  bool IsManagedModeEnabled();
++
++  // The single decision point. Logs every decision while managed mode is
++  // enabled and returns true when the request may proceed.
++  //
++  // A `kUserExplicit` request is always allowed and additionally establishes
++  // per-window USER_EXPLICIT/HUMAN ownership for `window_id`.
++  //
++  // A HUMAN-owned window answers `kInternal` requests (Chrome UI and native
++  // user flows that cannot be attributed further, for example the user-facing
++  // "Minimize window" action) and denies every automation origin (kAgentAssist
++  // / kExtension / kWebPage / kSessionRestore) for every action: automation
++  // must not show, minimize, re-show, restore, maximize, fullscreen,
++  // deactivate, move or resize a window the user owns (invariant 5.3).
++  //
++  // Windows the user does not own keep the BACKGROUND invariant for every
++  // action and every non-user origin, with one proven exception: kSetBounds
++  // only changes the frame of a hidden managed window
++  // (BrowserView::SetBounds -> Widget::SetBounds -> NativeWidgetMac::SetBounds
++  // -> host SetBoundsInScreen -> bridge SetBounds -> -[NSWindow
++  // setFrame:display:animate:]), and the single presentation-capable branch in
++  // that chain (a key-window-guarded reactivation) is rejected by the
++  // per-window suppression backstop. Restore / Maximize / Fullscreen /
++  // SetZOrder are denied because they can implicitly show or raise a hidden
++  // window.
++  bool AllowPresentation(ForegroundOrigin origin,
++                         BrowserCliPresentationAction action,
++                         uint64_t window_id);
++
++  // Drops per-window USER_EXPLICIT/HUMAN ownership. Called when the user hands
++  // a window back to the agent or when the window is destroyed, so a stale
++  // window id can never authorize a later presentation. No-op when the id is
++  // not owned; no-op while managed mode is disabled.
++  void ReleaseUserExplicitOwnership(uint64_t window_id, const char* reason);
++
++  // Whether `window_id` is currently USER_EXPLICIT/HUMAN-owned.
++  bool IsUserExplicitOwned(uint64_t window_id) const;
++
++  // Testing helpers. Reset restores the uninitialized (switch-driven) state.
++  void ResetForTesting();
++  void SetManagedModeEnabledForTesting(bool enabled);
++  BrowserCliPresentationState state_for_testing() const { return state_; }
++  size_t user_explicit_owned_window_count_for_testing() const {
++    return user_explicit_owned_window_ids_.size();
++  }
++
++ private:
++  friend class base::NoDestructor<BrowserCliPresentationPolicy>;
++
++  BrowserCliPresentationPolicy();
++  ~BrowserCliPresentationPolicy();
++
++  void EnsureInitializedFromCommandLine();
++  void LogDecision(ForegroundOrigin origin,
++                   BrowserCliPresentationAction action,
++                   uint64_t window_id,
++                   bool owned,
++                   bool allow,
++                   const char* reason);
++
++  bool initialized_ = false;
++  bool managed_mode_enabled_ = false;
++  BrowserCliPresentationState state_ = BrowserCliPresentationState::kUnmanaged;
++  uint64_t decision_count_ = 0;
++
++  // Per-window USER_EXPLICIT/HUMAN ownership (see AllowPresentation). This is
++  // deliberately a set of window ids, not a process-wide boolean.
++  std::set<uint64_t> user_explicit_owned_window_ids_;
++};
++
++}  // namespace views
++
++#endif  // UI_VIEWS_WIDGET_BROWSER_CLI_PRESENTATION_POLICY_H_
+diff --git a/ui/views/widget/browser_cli_presentation_policy_unittest.cc b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+new file mode 100644
+index 0000000000..bd9dc71293
+--- /dev/null
++++ b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+@@ -0,0 +1,315 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/views/widget/browser_cli_presentation_policy.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace views {
++namespace {
++
++constexpr BrowserCliPresentationAction kAllActions[] = {
++    BrowserCliPresentationAction::kShowAndActivate,
++    BrowserCliPresentationAction::kShowInactive,
++    BrowserCliPresentationAction::kMinimize,
++    BrowserCliPresentationAction::kMaximize,
++    BrowserCliPresentationAction::kRestore,
++    BrowserCliPresentationAction::kDeactivate,
++    BrowserCliPresentationAction::kFullscreen,
++    BrowserCliPresentationAction::kSetBounds,
++    BrowserCliPresentationAction::kSetZOrder};
++
++constexpr ForegroundOrigin kAutomationOrigins[] = {
++    ForegroundOrigin::kAgentAssist, ForegroundOrigin::kExtension,
++    ForegroundOrigin::kWebPage, ForegroundOrigin::kSessionRestore};
++
++// Browser CLI tests for the per-window USER_EXPLICIT/HUMAN ownership model.
++// The policy is a pure in-process state machine here: no native window is
++// created and no command line switch is needed (managed mode is forced via
++// SetManagedModeEnabledForTesting).
++class BrowserCliPresentationPolicyTest : public testing::Test {
++ protected:
++  void SetUp() override { policy()->ResetForTesting(); }
++  void TearDown() override { policy()->ResetForTesting(); }
++
++  BrowserCliPresentationPolicy* policy() {
++    return BrowserCliPresentationPolicy::Get();
++  }
++
++  bool Allow(ForegroundOrigin origin,
++             BrowserCliPresentationAction action,
++             uint64_t window_id) {
++    return policy()->AllowPresentation(origin, action, window_id);
++  }
++
++  bool AllowInternal(uint64_t window_id,
++                     BrowserCliPresentationAction action =
++                         BrowserCliPresentationAction::kShowAndActivate) {
++    return Allow(ForegroundOrigin::kInternal, action, window_id);
++  }
++};
++
++TEST_F(BrowserCliPresentationPolicyTest, UnmanagedAllowsAndTracksNothing) {
++  EXPECT_FALSE(policy()->IsManagedModeEnabled());
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kUnmanaged);
++
++  EXPECT_TRUE(AllowInternal(1));
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate, 1));
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(1));
++  EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 0u);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       BackgroundDeniesEveryActionExceptBoundsForUnowned) {
++  policy()->SetManagedModeEnabledForTesting(true);
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kBackground);
++
++  const ForegroundOrigin non_user_origins[] = {
++      ForegroundOrigin::kInternal, ForegroundOrigin::kAgentAssist,
++      ForegroundOrigin::kExtension, ForegroundOrigin::kWebPage,
++      ForegroundOrigin::kSessionRestore};
++
++  for (ForegroundOrigin origin : non_user_origins) {
++    for (BrowserCliPresentationAction action : kAllActions) {
++      const bool expected_allow =
++          action == BrowserCliPresentationAction::kSetBounds;
++      EXPECT_EQ(Allow(origin, action, /*window_id=*/7), expected_allow)
++          << "origin=" << static_cast<int>(origin)
++          << " action=" << static_cast<int>(action);
++    }
++  }
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(7));
++}
++
++// Regression test for the reviewed security gap: state changes that can
++// implicitly show, re-order or restore a hidden window must stay denied for
++// every origin on an unowned background window.
++TEST_F(BrowserCliPresentationPolicyTest,
++       BackgroundDeniesStateChangesThatCouldImplicitlyPresent) {
++  policy()->SetManagedModeEnabledForTesting(true);
++  constexpr BrowserCliPresentationAction kImplicitPresentationActions[] = {
++      BrowserCliPresentationAction::kShowAndActivate,
++      BrowserCliPresentationAction::kShowInactive,
++      BrowserCliPresentationAction::kMinimize,
++      BrowserCliPresentationAction::kMaximize,
++      BrowserCliPresentationAction::kRestore,
++      BrowserCliPresentationAction::kDeactivate,
++      BrowserCliPresentationAction::kFullscreen,
++      BrowserCliPresentationAction::kSetZOrder};
++
++  for (ForegroundOrigin origin : kAutomationOrigins) {
++    for (BrowserCliPresentationAction action : kImplicitPresentationActions) {
++      EXPECT_FALSE(Allow(origin, action, /*window_id=*/9))
++          << "origin=" << static_cast<int>(origin)
++          << " action=" << static_cast<int>(action);
++    }
++  }
++  for (BrowserCliPresentationAction action : kImplicitPresentationActions) {
++    EXPECT_FALSE(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/9))
++        << "action=" << static_cast<int>(action);
++  }
++
++  // The only proven non-presenting background action stays available to
++  // Chrome's own window arrangement and to background automation.
++  EXPECT_TRUE(AllowInternal(9, BrowserCliPresentationAction::kSetBounds));
++  EXPECT_TRUE(Allow(ForegroundOrigin::kExtension,
++                    BrowserCliPresentationAction::kSetBounds, 9));
++}
++
++// Core regression test for the former process-wide `kHuman` allow: one user
++// window must not authorize another window.
++TEST_F(BrowserCliPresentationPolicyTest,
++       UserExplicitOwnsOnlyThePresentedWindow) {
++  policy()->SetManagedModeEnabledForTesting(true);
++
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/1));
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(1));
++  EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 1u);
++
++  // The user's window keeps responding to un-attributed Chrome-internal
++  // requests (menu/button flows that cannot be attributed further), for every
++  // action.
++  for (BrowserCliPresentationAction action : kAllActions) {
++    EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/1))
++        << "action=" << static_cast<int>(action);
++  }
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kBackground);
++
++  // Invariant 5.3: no automation origin may show, minimize, re-show, restore,
++  // maximize, fullscreen, deactivate, move or resize the user's window.
++  for (ForegroundOrigin origin : kAutomationOrigins) {
++    for (BrowserCliPresentationAction action : kAllActions) {
++      EXPECT_FALSE(Allow(origin, action, /*window_id=*/1))
++          << "origin=" << static_cast<int>(origin)
++          << " action=" << static_cast<int>(action);
++    }
++  }
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(1));
++
++  // Every other window stays suppressed for every action and origin, except
++  // the proven non-presenting bounds change.
++  for (BrowserCliPresentationAction action : kAllActions) {
++    const bool expected_allow =
++        action == BrowserCliPresentationAction::kSetBounds;
++    EXPECT_EQ(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/2),
++              expected_allow)
++        << "action=" << static_cast<int>(action);
++  }
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(2));
++
++  // A second explicit user action owns its own window without affecting the
++  // first one.
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/2));
++  EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 2u);
++  EXPECT_TRUE(AllowInternal(1));
++  EXPECT_TRUE(AllowInternal(2));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, ReleaseRestoresBackgroundDenial) {
++  policy()->SetManagedModeEnabledForTesting(true);
++
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/3));
++  EXPECT_TRUE(AllowInternal(3));
++
++  policy()->ReleaseUserExplicitOwnership(3, "unit-test-hand-back");
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(3));
++  EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 0u);
++  EXPECT_FALSE(AllowInternal(3));
++
++  // A later explicit user action can re-own the window.
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/3));
++  EXPECT_TRUE(AllowInternal(3));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       ReleasedOwnershipDoesNotLeakToOtherIds) {
++  policy()->SetManagedModeEnabledForTesting(true);
++
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/4));
++  policy()->ReleaseUserExplicitOwnership(4, "window-destroyed");
++  EXPECT_FALSE(AllowInternal(4));
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(4));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, UnknownWindowIdIsAllowedButNotOwned) {
++  policy()->SetManagedModeEnabledForTesting(true);
++
++  // window_id 0 means "unknown": the user-explicit request itself may proceed
++  // (invariant 5.2), but it cannot establish ownership.
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/0));
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(0));
++  EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 0u);
++  EXPECT_FALSE(AllowInternal(0));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, DisabledModeIgnoresOwnershipApi) {
++  policy()->SetManagedModeEnabledForTesting(false);
++
++  policy()->ReleaseUserExplicitOwnership(5, "unit-test");
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(5));
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kUnmanaged);
++
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/5));
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(5));
++  EXPECT_TRUE(AllowInternal(5));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       HumanOwnedWindowDeniesAutomationButKeepsOwnership) {
++  policy()->SetManagedModeEnabledForTesting(true);
++  ASSERT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/11));
++
++  for (ForegroundOrigin origin : kAutomationOrigins) {
++    for (BrowserCliPresentationAction action : kAllActions) {
++      EXPECT_FALSE(Allow(origin, action, /*window_id=*/11))
++          << "origin=" << static_cast<int>(origin)
++          << " action=" << static_cast<int>(action);
++    }
++  }
++
++  // Denied automation requests must not release the user's ownership, and
++  // un-attributed internal requests stay allowed for every action.
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(11));
++  for (BrowserCliPresentationAction action : kAllActions) {
++    EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/11))
++        << "action=" << static_cast<int>(action);
++  }
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       ForegroundOriginScopeDefaultsToInternal) {
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, ForegroundOriginScopeSetsAndRestores) {
++  {
++    ScopedForegroundOrigin extension_scope(ForegroundOrigin::kExtension);
++    EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kExtension);
++    {
++      ScopedForegroundOrigin web_scope(ForegroundOrigin::kWebPage);
++      EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kWebPage);
++    }
++    EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kExtension);
++  }
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++}
++
++// Regression test for the `chrome.tabs.create` asynchronous window-creation
++// path. TabsCreateFunction::Run() hands the continuation to
++// CreateBrowserWindow(), which posts it on the same thread, so the producer's
++// scope has already unwound when the continuation runs. The extension origin
++// must therefore be bound by value across the task hop and re-scoped inside the
++// continuation (TabsCreateFunction::OnBrowserWindowCreatedWithOrigin). This
++// pins that exact primitive: the re-established scope is visible inside the
++// bound callback and does not leak into later tasks.
++TEST_F(BrowserCliPresentationPolicyTest,
++       BoundContinuationReattachesOriginWithoutLeaking) {
++  ForegroundOrigin captured = ForegroundOrigin::kInternal;
++  {
++    ScopedForegroundOrigin run_scope(ForegroundOrigin::kExtension);
++    captured = CurrentForegroundOrigin();
++  }
++  // The task hop: no scope is active anymore when the continuation runs.
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++
++  bool continuation_saw_extension = false;
++  base::OnceClosure continuation = base::BindOnce(
++      [](ForegroundOrigin origin, bool* saw_extension) {
++        ScopedForegroundOrigin continuation_scope(origin);
++        *saw_extension =
++            CurrentForegroundOrigin() == ForegroundOrigin::kExtension;
++      },
++      captured, &continuation_saw_extension);
++  std::move(continuation).Run();
++
++  EXPECT_TRUE(continuation_saw_extension);
++  // The continuation's scope must not outlive the callback.
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++}
++
++}  // namespace
++}  // namespace views
+diff --git a/ui/views/widget/native_widget_mac.mm b/ui/views/widget/native_widget_mac.mm
+index 4b50e18821..90427ee096 100644
+--- a/ui/views/widget/native_widget_mac.mm
++++ b/ui/views/widget/native_widget_mac.mm
+@@ -658,6 +658,9 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!ns_window_host_) {
+     return;
+   }
++  // Browser CLI: the programmatic-bounds policy gate for browser windows lives
++  // in BrowserView::SetBounds, so a denied extension request is rejected before
++  // its tab-fullscreen side effect. Other widget types are never HUMAN-owned.
+   ns_window_host_->SetBoundsInScreen(ConvertBoundsToScreenIfNeeded(bounds));
+ }
+ 
+@@ -784,7 +787,13 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+                        ? window_state
+                        : WindowVisibilityState::kShowInactive;
+   }
+-  GetNSWindowHost()->SetVisibilityState(window_state);
++  // Browser CLI Phase 2: when the background-presentation policy denies the
++  // request, the window stays hidden and must not receive initial focus
++  // either. Widget::Show() still completes its view-level bookkeeping.
++  const bool presented = GetNSWindowHost()->SetVisibilityState(window_state);
++  if (!presented) {
++    return;
++  }
+ 
+   // Ignore the SetInitialFocus() result. BridgedContentView should get
+   // firstResponder status regardless.
+@@ -815,6 +824,15 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+ }
+ 
+ void NativeWidgetMac::Deactivate() {
++  // Browser CLI: programmatic deactivation (extension windows API) is denied
++  // on a HUMAN-owned window. Note that macOS does not implement programmatic
++  // deactivation (see NOTIMPLEMENTED below); the gate keeps the policy log and
++  // is ready if a platform implementation lands.
++  if (!GetNSWindowHost() ||
++      !GetNSWindowHost()->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kDeactivate)) {
++    return;
++  }
+   NOTIMPLEMENTED();
+ }
+ 
+@@ -826,6 +844,14 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!GetNSWindowMojo()) {
+     return;
+   }
++  // Browser CLI: programmatic z-order changes (chrome.windows.create
++  // ScopedPinBrowserAtFront, PiP/floating UI) can raise a window; the policy
++  // denies them for automation on a HUMAN-owned window and for every origin on
++  // an unowned background window.
++  if (!GetNSWindowHost()->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kSetZOrder)) {
++    return;
++  }
+   z_order_level_ = order;
+   GetNSWindowMojo()->SetWindowLevel(CGWindowLevelForZOrderLevel(order, type_));
+ }
+@@ -863,6 +889,13 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!GetNSWindowMojo()) {
+     return;
+   }
++  // Browser CLI: programmatic zoom (extension windows API) is denied on a
++  // HUMAN-owned window. The user's native zoom (green button/menu) bypasses
++  // this path.
++  if (!GetNSWindowHost()->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kMaximize)) {
++    return;
++  }
+   GetNSWindowMojo()->SetZoomed(true);
+ }
+ 
+@@ -870,6 +903,14 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!GetNSWindowMojo()) {
+     return;
+   }
++  // Browser CLI: Widget::Minimize() is the programmatic minimize path
++  // (extension windows API, web-app windowing controls). The user's native
++  // minimize button and the Window menu go straight to AppKit and do not come
++  // through here. Deny automation minimize of a HUMAN-owned window.
++  if (!GetNSWindowHost()->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kMinimize)) {
++    return;
++  }
+   GetNSWindowMojo()->SetMiniaturized(true);
+ }
+ 
+@@ -891,6 +932,13 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!GetNSWindowMojo()) {
+     return;
+   }
++  // Browser CLI: programmatic restore (extension windows API) can deminiaturize
++  // and re-show a window, so it is denied on a HUMAN-owned window. Chrome UI
++  // (menu "Restore") stays internal and allowed.
++  if (!GetNSWindowHost()->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kRestore)) {
++    return;
++  }
+   GetNSWindowMojo()->ExitFullscreen();
+   GetNSWindowMojo()->SetMiniaturized(false);
+   GetNSWindowMojo()->SetZoomed(false);
+@@ -901,6 +949,13 @@ void OnDidChangeFocus(View* focused_before, View* focused_now) override {
+   if (!ns_window_host_) {
+     return;
+   }
++  // Browser CLI: programmatic fullscreen (extension windows API) is denied on a
++  // HUMAN-owned window. The user's native fullscreen (green button/Window menu)
++  // goes through AppKit and does not come through here.
++  if (!ns_window_host_->AllowProgrammaticChangeFromCurrentOrigin(
++          BrowserCliPresentationAction::kFullscreen)) {
++    return;
++  }
+   ns_window_host_->SetFullscreen(fullscreen, target_display_id);
+ }
+ 

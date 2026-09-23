@@ -1,0 +1,1302 @@
+diff --git a/ui/views/BUILD.gn b/ui/views/BUILD.gn
+index 9884907a3f..36c762ee7a 100644
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -1069,6 +1069,8 @@ if (is_win || is_mac || is_linux || is_chromeos) {
+ 
+ source_set("browser_cli_presentation_policy") {
+   sources = [
++    "widget/browser_cli_foreground_lease.cc",
++    "widget/browser_cli_foreground_lease.h",
+     "widget/browser_cli_presentation_policy.cc",
+     "widget/browser_cli_presentation_policy.h",
+   ]
+@@ -1304,6 +1306,17 @@ test("browser_cli_presentation_policy_unittests") {
+   ]
+ }
+ 
++test("browser_cli_foreground_lease_unittests") {
++  sources = [ "widget/browser_cli_foreground_lease_unittest.cc" ]
++  deps = [
++    ":browser_cli_presentation_policy",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
++
+ test("views_unittests") {
+   use_xvfb = use_xvfb_in_this_config
+ 
+diff --git a/ui/views/widget/browser_cli_foreground_lease.cc b/ui/views/widget/browser_cli_foreground_lease.cc
+new file mode 100644
+index 0000000000..6976f984f1
+--- /dev/null
++++ b/ui/views/widget/browser_cli_foreground_lease.cc
+@@ -0,0 +1,87 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/views/widget/browser_cli_foreground_lease.h"
++
++namespace views {
++
++const char* ForegroundAssistReasonToString(ForegroundAssistReason reason) {
++  switch (reason) {
++    case ForegroundAssistReason::kLogin:
++      return "login";
++    case ForegroundAssistReason::kCaptcha:
++      return "captcha";
++    case ForegroundAssistReason::kConfirmation:
++      return "confirmation";
++    case ForegroundAssistReason::kOther:
++      return "other";
++  }
++}
++
++const char* ForegroundAssistRequestResultToString(
++    ForegroundAssistRequestResult result) {
++  switch (result) {
++    case ForegroundAssistRequestResult::kGranted:
++      return "granted";
++    case ForegroundAssistRequestResult::kDenied:
++      return "denied";
++    case ForegroundAssistRequestResult::kBusy:
++      return "busy";
++    case ForegroundAssistRequestResult::kInvalidTarget:
++      return "invalid-target";
++  }
++}
++
++const char* ForegroundAssistReleaseReasonToString(
++    ForegroundAssistReleaseReason reason) {
++  switch (reason) {
++    case ForegroundAssistReleaseReason::kAgentRelease:
++      return "agent-release";
++    case ForegroundAssistReleaseReason::kTimeout:
++      return "timeout";
++    case ForegroundAssistReleaseReason::kUserTakeover:
++      return "user-takeover";
++    case ForegroundAssistReleaseReason::kWindowDestroyed:
++      return "window-destroyed";
++  }
++}
++
++bool IsForegroundLeaseActive(const ForegroundLease& lease,
++                             base::TimeTicks now) {
++  // The live interval is [granted_at, expires_at): a lease is not active
++  // before it was granted, and it is already expired at its deadline.
++  return lease.window_id != 0 && lease.granted_at <= now &&
++         now < lease.expires_at;
++}
++
++ForegroundAssistRequestDecision EvaluateForegroundAssistRequest(
++    bool managed_mode_enabled,
++    bool requester_is_agent_assist,
++    uint64_t window_id,
++    bool target_is_human_owned,
++    uint64_t active_lease_window_id) {
++  if (!managed_mode_enabled) {
++    return {ForegroundAssistRequestResult::kDenied, "unmanaged-stock-behavior"};
++  }
++  if (!requester_is_agent_assist) {
++    return {ForegroundAssistRequestResult::kDenied, "assist-origin-not-agent"};
++  }
++  if (window_id == 0) {
++    return {ForegroundAssistRequestResult::kInvalidTarget,
++            "assist-invalid-target"};
++  }
++  if (target_is_human_owned) {
++    return {ForegroundAssistRequestResult::kDenied,
++            "assist-target-human-owned"};
++  }
++  if (active_lease_window_id == window_id) {
++    return {ForegroundAssistRequestResult::kGranted, "assist-already-granted"};
++  }
++  if (active_lease_window_id != 0) {
++    return {ForegroundAssistRequestResult::kBusy, "assist-busy"};
++  }
++  return {ForegroundAssistRequestResult::kGranted, "assist-granted"};
++}
++
++}  // namespace views
+diff --git a/ui/views/widget/browser_cli_foreground_lease.h b/ui/views/widget/browser_cli_foreground_lease.h
+new file mode 100644
+index 0000000000..0874549aa1
+--- /dev/null
++++ b/ui/views/widget/browser_cli_foreground_lease.h
+@@ -0,0 +1,120 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_LEASE_H_
++#define UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_LEASE_H_
++
++#include <stdint.h>
++
++#include "base/time/time.h"
++#include "ui/views/views_export.h"
++
++namespace views {
++
++// Foreground assist lease vocabulary and pure decision helpers (development
++// plan section 6, Phase 4 Slice 1).
++//
++// A lease is the only way an agent-originated request may present a managed
++// window: it is single-instance (at most one live lease per process), scoped to
++// exactly one window, and expires on its own after
++// kDefaultForegroundAssistLeaseTtl. Expiry is lazy: nothing here starts a
++// timer, shows, hides or otherwise touches a window, and the policy only
++// records the lease so the decision log and AllowPresentation() can answer the
++// lease-attributed requests that a later producer slice will issue.
++//
++// This file is deliberately free of policy and window dependencies so the
++// whole decision matrix is unit-testable without a browser process.
++
++// Why a foreground assist was requested. Fixed first-version vocabulary; the
++// strings are part of the structured log contract.
++enum class ForegroundAssistReason {
++  kLogin,
++  kCaptcha,
++  kConfirmation,
++  kOther,
++};
++
++// Outcome of one lease request.
++enum class ForegroundAssistRequestResult {
++  // A live lease now covers the requested window: newly granted, or an
++  // idempotent re-request for the window that already holds the lease.
++  kGranted,
++  // The request is refused and no lease exists: managed mode is off, the
++  // requester is not the agent, or the target is HUMAN-owned.
++  kDenied,
++  // Another window currently holds the single lease.
++  kBusy,
++  // window_id 0: the requester did not name a real target.
++  kInvalidTarget,
++};
++
++// Why a lease stopped covering its window. A user takeover releases the lease
++// before the window becomes HUMAN-owned, so no assist release path can ever
++// run for a HUMAN-owned window.
++enum class ForegroundAssistReleaseReason {
++  kAgentRelease,
++  kTimeout,
++  kUserTakeover,
++  kWindowDestroyed,
++};
++
++// Default lease lifetime. Five minutes is long enough for a login / captcha /
++// confirmation flow and short enough that a crashed agent cannot leave a
++// window presented for long. Slice 1 only records the deadline; the release
++// entry point is ReleaseExpiredForegroundAssistLeases().
++inline constexpr base::TimeDelta kDefaultForegroundAssistLeaseTtl =
++    base::Minutes(5);
++
++// One live foreground assist lease. target_tab is audit-only in Slice 1: the
++// lease authorizes exactly one window and never a set of windows or tabs.
++struct VIEWS_EXPORT ForegroundLease {
++  uint64_t window_id = 0;
++  uint64_t target_tab = 0;
++  ForegroundAssistReason reason = ForegroundAssistReason::kOther;
++  base::TimeTicks granted_at;
++  base::TimeTicks expires_at;
++  uint64_t request_seq = 0;
++};
++
++VIEWS_EXPORT const char* ForegroundAssistReasonToString(
++    ForegroundAssistReason reason);
++VIEWS_EXPORT const char* ForegroundAssistRequestResultToString(
++    ForegroundAssistRequestResult result);
++VIEWS_EXPORT const char* ForegroundAssistReleaseReasonToString(
++    ForegroundAssistReleaseReason reason);
++
++// Whether `lease` covers `now` (and names a real window). A lease is live for
++// now in [granted_at, expires_at): at expires_at it is already expired.
++VIEWS_EXPORT bool IsForegroundLeaseActive(const ForegroundLease& lease,
++                                          base::TimeTicks now);
++
++// One request decision: the result plus the stable machine-readable reason
++// used in the BROWSER_CLI_PRESENTATION transition log.
++struct VIEWS_EXPORT ForegroundAssistRequestDecision {
++  ForegroundAssistRequestResult result = ForegroundAssistRequestResult::kDenied;
++  const char* reason = nullptr;
++};
++
++// Pure, ordered decision for one lease request. The order encodes the security
++// requirements and is part of the contract:
++//   1. unmanaged mode denies (stock Chromium has no assist);
++//   2. only the agent origin may ever be granted (fail closed);
++//   3. window_id 0 is an invalid target;
++//   4. a HUMAN-owned target is always denied (invariant 5.3), even while
++//      another lease would also make the request busy;
++//   5. a request for the window that already holds the lease is an idempotent
++//      kGranted that does not extend the deadline;
++//   6. any other live lease makes this request kBusy (single instance).
++// `active_lease_window_id` is 0 when no lease is live; the caller must have
++// lazily released expired leases before calling.
++VIEWS_EXPORT ForegroundAssistRequestDecision
++EvaluateForegroundAssistRequest(bool managed_mode_enabled,
++                                bool requester_is_agent_assist,
++                                uint64_t window_id,
++                                bool target_is_human_owned,
++                                uint64_t active_lease_window_id);
++
++}  // namespace views
++
++#endif  // UI_VIEWS_WIDGET_BROWSER_CLI_FOREGROUND_LEASE_H_
+diff --git a/ui/views/widget/browser_cli_foreground_lease_unittest.cc b/ui/views/widget/browser_cli_foreground_lease_unittest.cc
+new file mode 100644
+index 0000000000..9fcba2fe93
+--- /dev/null
++++ b/ui/views/widget/browser_cli_foreground_lease_unittest.cc
+@@ -0,0 +1,205 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/views/widget/browser_cli_foreground_lease.h"
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace views {
++namespace {
++
++// Pure unit tests for the foreground assist lease vocabulary and the ordered
++// request decision. No policy singleton, no window and no timer is involved.
++
++TEST(BrowserCliForegroundLeaseTest, ReasonStringsAreStable) {
++  EXPECT_STREQ(ForegroundAssistReasonToString(ForegroundAssistReason::kLogin),
++               "login");
++  EXPECT_STREQ(ForegroundAssistReasonToString(ForegroundAssistReason::kCaptcha),
++               "captcha");
++  EXPECT_STREQ(
++      ForegroundAssistReasonToString(ForegroundAssistReason::kConfirmation),
++      "confirmation");
++  EXPECT_STREQ(ForegroundAssistReasonToString(ForegroundAssistReason::kOther),
++               "other");
++}
++
++TEST(BrowserCliForegroundLeaseTest, RequestResultStringsAreStable) {
++  EXPECT_STREQ(ForegroundAssistRequestResultToString(
++                   ForegroundAssistRequestResult::kGranted),
++               "granted");
++  EXPECT_STREQ(ForegroundAssistRequestResultToString(
++                   ForegroundAssistRequestResult::kDenied),
++               "denied");
++  EXPECT_STREQ(ForegroundAssistRequestResultToString(
++                   ForegroundAssistRequestResult::kBusy),
++               "busy");
++  EXPECT_STREQ(ForegroundAssistRequestResultToString(
++                   ForegroundAssistRequestResult::kInvalidTarget),
++               "invalid-target");
++}
++
++TEST(BrowserCliForegroundLeaseTest, ReleaseReasonStringsAreStable) {
++  EXPECT_STREQ(ForegroundAssistReleaseReasonToString(
++                   ForegroundAssistReleaseReason::kAgentRelease),
++               "agent-release");
++  EXPECT_STREQ(ForegroundAssistReleaseReasonToString(
++                   ForegroundAssistReleaseReason::kTimeout),
++               "timeout");
++  EXPECT_STREQ(ForegroundAssistReleaseReasonToString(
++                   ForegroundAssistReleaseReason::kUserTakeover),
++               "user-takeover");
++  EXPECT_STREQ(ForegroundAssistReleaseReasonToString(
++                   ForegroundAssistReleaseReason::kWindowDestroyed),
++               "window-destroyed");
++}
++
++TEST(BrowserCliForegroundLeaseTest, DefaultTtlIsFiveMinutes) {
++  EXPECT_EQ(kDefaultForegroundAssistLeaseTtl, base::Minutes(5));
++}
++
++TEST(BrowserCliForegroundLeaseTest, LeaseIsActiveUntilExpiry) {
++  const base::TimeTicks granted_at = base::TimeTicks() + base::Minutes(100);
++  ForegroundLease lease;
++  lease.window_id = 7;
++  lease.granted_at = granted_at;
++  lease.expires_at = granted_at + base::Minutes(5);
++
++  // Before granted_at the lease does not exist yet: not active.
++  EXPECT_FALSE(
++      IsForegroundLeaseActive(lease, granted_at - base::Milliseconds(1)));
++  // At granted_at the lease is already active (closed lower bound).
++  EXPECT_TRUE(IsForegroundLeaseActive(lease, granted_at));
++  EXPECT_TRUE(IsForegroundLeaseActive(lease, granted_at + base::Minutes(4)));
++  EXPECT_TRUE(
++      IsForegroundLeaseActive(lease, lease.expires_at - base::Milliseconds(1)));
++  // At the deadline the lease is already expired (half-open upper bound).
++  EXPECT_FALSE(IsForegroundLeaseActive(lease, lease.expires_at));
++  EXPECT_FALSE(
++      IsForegroundLeaseActive(lease, lease.expires_at + base::Milliseconds(1)));
++
++  // A lease without a real window id is never active.
++  ForegroundLease unnamed = lease;
++  unnamed.window_id = 0;
++  EXPECT_FALSE(IsForegroundLeaseActive(unnamed, granted_at));
++}
++
++// Explicit interval-boundary regression test for the reviewed contract
++// [granted_at, expires_at): the implementation previously only checked the
++// upper bound, so a time before granted_at wrongly reported active.
++TEST(BrowserCliForegroundLeaseTest, LeaseIntervalBoundariesAreExplicit) {
++  const base::TimeTicks granted_at = base::TimeTicks() + base::Seconds(1000);
++  ForegroundLease lease;
++  lease.window_id = 3;
++  lease.granted_at = granted_at;
++  lease.expires_at = granted_at + base::Seconds(60);
++
++  // 1 ms before granted_at: not active.
++  EXPECT_FALSE(
++      IsForegroundLeaseActive(lease, granted_at - base::Milliseconds(1)));
++  // Exactly at granted_at: active.
++  EXPECT_TRUE(IsForegroundLeaseActive(lease, granted_at));
++  // Exactly at expires_at: not active.
++  EXPECT_FALSE(IsForegroundLeaseActive(lease, lease.expires_at));
++}
++
++// The ordered decision contract: the reason string is part of the log
++// contract, so this pins result and reason for every combination of the five
++// inputs (2 * 2 * 2 * 2 * 3 = 48 cases).
++TEST(BrowserCliForegroundLeaseTest, RequestDecisionIsExhaustiveOverInputs) {
++  struct Expected {
++    ForegroundAssistRequestResult result;
++    const char* reason;
++  };
++  const auto expected_for = [](bool managed_mode_enabled,
++                               bool requester_is_agent_assist,
++                               uint64_t window_id, bool target_is_human_owned,
++                               uint64_t active_lease_window_id) -> Expected {
++    // Mirrors the documented order: unmanaged, origin, invalid target,
++    // HUMAN-owned target, idempotent same-window, busy, granted.
++    if (!managed_mode_enabled) {
++      return {ForegroundAssistRequestResult::kDenied,
++              "unmanaged-stock-behavior"};
++    }
++    if (!requester_is_agent_assist) {
++      return {ForegroundAssistRequestResult::kDenied,
++              "assist-origin-not-agent"};
++    }
++    if (window_id == 0) {
++      return {ForegroundAssistRequestResult::kInvalidTarget,
++              "assist-invalid-target"};
++    }
++    if (target_is_human_owned) {
++      return {ForegroundAssistRequestResult::kDenied,
++              "assist-target-human-owned"};
++    }
++    if (active_lease_window_id == window_id) {
++      return {ForegroundAssistRequestResult::kGranted,
++              "assist-already-granted"};
++    }
++    if (active_lease_window_id != 0) {
++      return {ForegroundAssistRequestResult::kBusy, "assist-busy"};
++    }
++    return {ForegroundAssistRequestResult::kGranted, "assist-granted"};
++  };
++
++  int cases = 0;
++  for (const bool managed : {false, true}) {
++    for (const bool agent : {false, true}) {
++      for (const uint64_t window_id : {uint64_t{0}, uint64_t{7}}) {
++        for (const bool human_owned : {false, true}) {
++          for (const uint64_t active :
++               {uint64_t{0}, uint64_t{7}, uint64_t{9}}) {
++            const Expected expected =
++                expected_for(managed, agent, window_id, human_owned, active);
++            const ForegroundAssistRequestDecision decision =
++                EvaluateForegroundAssistRequest(managed, agent, window_id,
++                                                human_owned, active);
++            EXPECT_EQ(decision.result, expected.result)
++                << "managed=" << managed << " agent=" << agent
++                << " window_id=" << window_id << " human=" << human_owned
++                << " active=" << active;
++            EXPECT_STREQ(decision.reason, expected.reason)
++                << "managed=" << managed << " agent=" << agent
++                << " window_id=" << window_id << " human=" << human_owned
++                << " active=" << active;
++            ++cases;
++          }
++        }
++      }
++    }
++  }
++  EXPECT_EQ(cases, 48);
++}
++
++// Precedence checks for the security-relevant orderings, stated separately
++// from the exhaustive table so a reordering regression fails loudly.
++TEST(BrowserCliForegroundLeaseTest, RequestDecisionPrecedence) {
++  // HUMAN ownership beats busy and grants.
++  ForegroundAssistRequestDecision decision = EvaluateForegroundAssistRequest(
++      /*managed_mode_enabled=*/true, /*requester_is_agent_assist=*/true,
++      /*window_id=*/5, /*target_is_human_owned=*/true,
++      /*active_lease_window_id=*/9);
++  EXPECT_EQ(decision.result, ForegroundAssistRequestResult::kDenied);
++  EXPECT_STREQ(decision.reason, "assist-target-human-owned");
++
++  // Origin validation beats every other denial.
++  decision = EvaluateForegroundAssistRequest(
++      /*managed_mode_enabled=*/true, /*requester_is_agent_assist=*/false,
++      /*window_id=*/0, /*target_is_human_owned=*/true,
++      /*active_lease_window_id=*/9);
++  EXPECT_EQ(decision.result, ForegroundAssistRequestResult::kDenied);
++  EXPECT_STREQ(decision.reason, "assist-origin-not-agent");
++
++  // Unmanaged mode beats every other denial.
++  decision = EvaluateForegroundAssistRequest(
++      /*managed_mode_enabled=*/false, /*requester_is_agent_assist=*/false,
++      /*window_id=*/0, /*target_is_human_owned=*/true,
++      /*active_lease_window_id=*/9);
++  EXPECT_EQ(decision.result, ForegroundAssistRequestResult::kDenied);
++  EXPECT_STREQ(decision.reason, "unmanaged-stock-behavior");
++}
++
++}  // namespace
++}  // namespace views
+diff --git a/ui/views/widget/browser_cli_presentation_policy.cc b/ui/views/widget/browser_cli_presentation_policy.cc
+index 79407fc665..d53efccfc8 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.cc
++++ b/ui/views/widget/browser_cli_presentation_policy.cc
+@@ -57,11 +57,33 @@ const char* StateToString(BrowserCliPresentationState state) {
+       return "unmanaged";
+     case BrowserCliPresentationState::kBackground:
+       return "background";
++    case BrowserCliPresentationState::kAssist:
++      return "assist";
+     case BrowserCliPresentationState::kHuman:
+       return "human";
+   }
+ }
+ 
++// The only actions a live foreground assist lease grants to its own window for
++// the agent origin: the presentation the lease exists for, plus the proven
++// non-presenting bounds change. Everything else (minimize, maximize, restore,
++// fullscreen, deactivate, z-order) is denied even on the leased window.
++bool IsForegroundAssistAllowedAction(BrowserCliPresentationAction action) {
++  switch (action) {
++    case BrowserCliPresentationAction::kShowAndActivate:
++    case BrowserCliPresentationAction::kShowInactive:
++    case BrowserCliPresentationAction::kSetBounds:
++      return true;
++    case BrowserCliPresentationAction::kMinimize:
++    case BrowserCliPresentationAction::kMaximize:
++    case BrowserCliPresentationAction::kRestore:
++    case BrowserCliPresentationAction::kDeactivate:
++    case BrowserCliPresentationAction::kFullscreen:
++    case BrowserCliPresentationAction::kSetZOrder:
++      return false;
++  }
++}
++
+ // Automation origins may never act on a window the user explicitly owns
+ // (invariant 5.3). `kInternal` is deliberately not an automation origin: it is
+ // the un-attributed catch-all used by Chrome UI and native user flows.
+@@ -139,16 +161,29 @@ bool BrowserCliPresentationPolicy::AllowPresentation(
+     return true;
+   }
+ 
++  // Lazy lease expiry: an expired lease must never authorize a decision or
++  // report as leased. No-op (and no log) while no lease exists, so the
++  // lease-free behavior stays byte-identical.
++  ReleaseExpiredForegroundAssistLeasesLocked();
++
+   bool allow = false;
+   const char* reason = nullptr;
+   bool newly_owned = false;
+   const bool owned = user_explicit_owned_window_ids_.count(window_id) > 0;
++  const bool leased = active_foreground_assist_lease_ &&
++                      active_foreground_assist_lease_->window_id == window_id;
+   if (origin == ForegroundOrigin::kUserExplicit) {
+     // Invariant 5.2: explicit user actions always win. Ownership is granted
+     // per window, never process-wide (invariant 5.1 stays intact for every
+-    // other window).
++    // other window). A user takeover of a leased window releases the lease
++    // first (requirement: release, then HUMAN), so no assist release path can
++    // ever run for a HUMAN-owned window afterwards.
+     allow = true;
+     reason = "user-explicit-always-allowed";
++    if (leased) {
++      ReleaseForegroundAssistLocked(
++          window_id, ForegroundAssistReleaseReason::kUserTakeover);
++    }
+     if (window_id != 0) {
+       newly_owned = user_explicit_owned_window_ids_.insert(window_id).second;
+     }
+@@ -163,6 +198,26 @@ bool BrowserCliPresentationPolicy::AllowPresentation(
+     // allowed on the user's own window.
+     allow = true;
+     reason = "human-owned-window-internal-allowed";
++  } else if (leased) {
++    // A live lease covers exactly this window. It grants the lease's own show
++    // actions to the agent and keeps answering un-attributed internal requests
++    // (native user flows), while extension / web page / session restore stay
++    // denied on the assist window: the lease never lets another automation
++    // origin ride along, and it never authorizes a second window.
++    if (origin == ForegroundOrigin::kInternal) {
++      allow = true;
++      reason = "assist-window-internal-allowed";
++    } else if (origin == ForegroundOrigin::kAgentAssist &&
++               IsForegroundAssistAllowedAction(action)) {
++      allow = true;
++      reason = "assist-window-lease-allowed";
++    } else if (origin == ForegroundOrigin::kAgentAssist) {
++      allow = false;
++      reason = "assist-action-not-granted";
++    } else {
++      allow = false;
++      reason = "assist-window-automation-denied";
++    }
+   } else if (action == BrowserCliPresentationAction::kSetBounds) {
+     // Proven non-presenting for a hidden managed window: the macOS chain
+     // (BrowserView::SetBounds -> Widget::SetBounds ->
+@@ -196,12 +251,18 @@ bool BrowserCliPresentationPolicy::AllowPresentation(
+   // when it is un-attributed (window creation/layout/session restore).
+   // Denials and every automation decision are always logged.
+   const bool owned_after = owned || newly_owned;
+-  const bool quiet_allow = allow &&
+-                           action == BrowserCliPresentationAction::kSetBounds &&
+-                           !owned_after && !IsAutomationOrigin(origin);
++  // Recompute from the lease that survives this decision: a user takeover has
++  // already released it, so the takeover decision must not report `leased=yes`
++  // (and no assist decision can ever report `owned=yes`).
++  const bool leased_after =
++      active_foreground_assist_lease_ &&
++      active_foreground_assist_lease_->window_id == window_id;
++  const bool quiet_allow =
++      allow && action == BrowserCliPresentationAction::kSetBounds &&
++      !owned_after && !leased_after && !IsAutomationOrigin(origin);
+   if (!quiet_allow) {
+-    LogDecision(origin, action, window_id, /*owned=*/owned_after, allow,
+-                reason);
++    LogDecision(origin, action, window_id, /*owned=*/owned_after,
++                /*leased=*/leased_after, allow, reason);
+   }
+   return allow;
+ }
+@@ -228,12 +289,154 @@ bool BrowserCliPresentationPolicy::IsUserExplicitOwned(
+   return user_explicit_owned_window_ids_.count(window_id) > 0;
+ }
+ 
++ForegroundAssistRequestResult
++BrowserCliPresentationPolicy::RequestForegroundAssist(
++    ForegroundOrigin requester_origin,
++    uint64_t window_id,
++    uint64_t target_tab,
++    ForegroundAssistReason reason) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    // Stock Chromium has no assist; fail closed without adding log noise to
++    // unmanaged runs.
++    return ForegroundAssistRequestResult::kDenied;
++  }
++  ReleaseExpiredForegroundAssistLeasesLocked();
++
++  const uint64_t active_window_id =
++      active_foreground_assist_lease_
++          ? active_foreground_assist_lease_->window_id
++          : 0;
++  const ForegroundAssistRequestDecision decision =
++      EvaluateForegroundAssistRequest(
++          /*managed_mode_enabled=*/true,
++          /*requester_is_agent_assist=*/
++          requester_origin == ForegroundOrigin::kAgentAssist, window_id,
++          IsUserExplicitOwned(window_id), active_window_id);
++
++  if (decision.result == ForegroundAssistRequestResult::kGranted) {
++    if (active_window_id != window_id) {
++      ForegroundLease lease;
++      lease.window_id = window_id;
++      lease.target_tab = target_tab;
++      lease.reason = reason;
++      lease.granted_at = Now();
++      lease.expires_at = lease.granted_at + kDefaultForegroundAssistLeaseTtl;
++      lease.request_seq = ++assist_request_seq_;
++      active_foreground_assist_lease_ = lease;
++    }
++    // The idempotent re-request for the lease holder reports the live lease
++    // (including its unchanged deadline) so the log always matches the state.
++    const ForegroundLease& live = *active_foreground_assist_lease_;
++    LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++              << " transition=assist-lease-granted"
++              << " window_id=" << live.window_id
++              << " target_tab=" << live.target_tab
++              << " lease_reason=" << ForegroundAssistReasonToString(live.reason)
++              << " request_seq=" << live.request_seq
++              << " ttl_ms=" << kDefaultForegroundAssistLeaseTtl.InMilliseconds()
++              << " expires_at_ms="
++              << live.expires_at.since_origin().InMilliseconds()
++              << " reason=" << decision.reason;
++    return ForegroundAssistRequestResult::kGranted;
++  }
++
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++            << " transition=assist-lease-denied"
++            << " window_id=" << window_id << " target_tab=" << target_tab
++            << " lease_reason=" << ForegroundAssistReasonToString(reason)
++            << " active_window_id=" << active_window_id
++            << " reason=" << decision.reason;
++  return decision.result;
++}
++
++void BrowserCliPresentationPolicy::ReleaseForegroundAssist(
++    uint64_t window_id,
++    ForegroundAssistReleaseReason reason) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return;
++  }
++  ReleaseExpiredForegroundAssistLeasesLocked();
++  ReleaseForegroundAssistLocked(window_id, reason);
++}
++
++size_t BrowserCliPresentationPolicy::ReleaseExpiredForegroundAssistLeases() {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return 0;
++  }
++  return ReleaseExpiredForegroundAssistLeasesLocked();
++}
++
++bool BrowserCliPresentationPolicy::IsForegroundAssistLeased(
++    uint64_t window_id) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return false;
++  }
++  ReleaseExpiredForegroundAssistLeasesLocked();
++  return active_foreground_assist_lease_ &&
++         active_foreground_assist_lease_->window_id == window_id;
++}
++
++BrowserCliPresentationState
++BrowserCliPresentationPolicy::window_state_for_testing(uint64_t window_id) {
++  if (state_ != BrowserCliPresentationState::kBackground) {
++    return state_;
++  }
++  if (IsUserExplicitOwned(window_id)) {
++    return BrowserCliPresentationState::kHuman;
++  }
++  if (IsForegroundAssistLeased(window_id)) {
++    return BrowserCliPresentationState::kAssist;
++  }
++  return BrowserCliPresentationState::kBackground;
++}
++
++void BrowserCliPresentationPolicy::ReleaseForegroundAssistLocked(
++    uint64_t window_id,
++    ForegroundAssistReleaseReason reason) {
++  if (!active_foreground_assist_lease_ ||
++      active_foreground_assist_lease_->window_id != window_id) {
++    return;
++  }
++  const ForegroundLease lease = *active_foreground_assist_lease_;
++  active_foreground_assist_lease_.reset();
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
++            << " transition=assist-lease-released"
++            << " window_id=" << lease.window_id
++            << " target_tab=" << lease.target_tab
++            << " lease_reason=" << ForegroundAssistReasonToString(lease.reason)
++            << " request_seq=" << lease.request_seq
++            << " reason=" << ForegroundAssistReleaseReasonToString(reason);
++}
++
++size_t
++BrowserCliPresentationPolicy::ReleaseExpiredForegroundAssistLeasesLocked() {
++  if (!active_foreground_assist_lease_ ||
++      IsForegroundLeaseActive(*active_foreground_assist_lease_, Now())) {
++    return 0;
++  }
++  const uint64_t window_id = active_foreground_assist_lease_->window_id;
++  ReleaseForegroundAssistLocked(window_id,
++                                ForegroundAssistReleaseReason::kTimeout);
++  return 1;
++}
++
++base::TimeTicks BrowserCliPresentationPolicy::Now() const {
++  return now_for_testing_.is_null() ? base::TimeTicks::Now() : now_for_testing_;
++}
++
+ void BrowserCliPresentationPolicy::ResetForTesting() {
+   initialized_ = false;
+   managed_mode_enabled_ = false;
+   state_ = BrowserCliPresentationState::kUnmanaged;
+   decision_count_ = 0;
+   user_explicit_owned_window_ids_.clear();
++  active_foreground_assist_lease_.reset();
++  assist_request_seq_ = 0;
++  now_for_testing_ = base::TimeTicks();
+   g_current_foreground_origin = ForegroundOrigin::kInternal;
+ }
+ 
+@@ -244,6 +447,9 @@ void BrowserCliPresentationPolicy::SetManagedModeEnabledForTesting(
+   state_ = enabled ? BrowserCliPresentationState::kBackground
+                    : BrowserCliPresentationState::kUnmanaged;
+   user_explicit_owned_window_ids_.clear();
++  active_foreground_assist_lease_.reset();
++  assist_request_seq_ = 0;
++  now_for_testing_ = base::TimeTicks();
+ }
+ 
+ void BrowserCliPresentationPolicy::LogDecision(
+@@ -251,15 +457,24 @@ void BrowserCliPresentationPolicy::LogDecision(
+     BrowserCliPresentationAction action,
+     uint64_t window_id,
+     bool owned,
++    bool leased,
+     bool allow,
+     const char* reason) {
+   // `state=` describes the window the decision is about: a USER_EXPLICIT-owned
+-  // window is `human` even though the browser mode stays `background`. This
+-  // keeps "no internal allow in background" assertions precise.
+-  const BrowserCliPresentationState window_state =
+-      state_ == BrowserCliPresentationState::kBackground && owned
+-          ? BrowserCliPresentationState::kHuman
+-          : state_;
++  // window is `human` and a lease-covered window is `assist`, even though the
++  // browser mode stays `background`. This keeps "no internal allow in
++  // background" assertions precise, and `owned=yes` stays reserved for HUMAN
++  // ownership. `leased=yes` is only emitted while a lease covers the decision's
++  // window, so lease-free log lines remain byte-identical to the pre-lease
++  // contract.
++  BrowserCliPresentationState window_state = state_;
++  if (state_ == BrowserCliPresentationState::kBackground) {
++    if (owned) {
++      window_state = BrowserCliPresentationState::kHuman;
++    } else if (leased) {
++      window_state = BrowserCliPresentationState::kAssist;
++    }
++  }
+   ++decision_count_;
+   LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=policy"
+             << " seq=" << decision_count_
+@@ -270,7 +485,7 @@ void BrowserCliPresentationPolicy::LogDecision(
+             << " state=" << StateToString(window_state)
+             << " owned=" << (owned ? "yes" : "no")
+             << " owned_windows=" << user_explicit_owned_window_ids_.size()
+-            << " reason=" << reason;
++            << (leased ? " leased=yes" : "") << " reason=" << reason;
+ }
+ 
+ }  // namespace views
+diff --git a/ui/views/widget/browser_cli_presentation_policy.h b/ui/views/widget/browser_cli_presentation_policy.h
+index 4e2f6bdae8..d32d2c0e11 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.h
++++ b/ui/views/widget/browser_cli_presentation_policy.h
+@@ -8,11 +8,14 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#include <optional>
+ #include <set>
+ 
+ #include "base/no_destructor.h"
++#include "base/time/time.h"
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/views/views_export.h"
++#include "ui/views/widget/browser_cli_foreground_lease.h"
+ 
+ namespace views {
+ 
+@@ -35,6 +38,13 @@ namespace views {
+ //     exception is a programmatic bounds change (kSetBounds), which is proven
+ //     not to present a hidden window on macOS (see AllowPresentation).
+ //
++// Foreground assist (development plan section 6, Phase 4 Slice 1) adds one
++// single-instance, per-window lease on top of that model: only the agent origin
++// may request it, a HUMAN-owned window is never a valid target, it expires
++// lazily after kDefaultForegroundAssistLeaseTtl, and it authorizes only the
++// show actions of its own window. It never expands HUMAN ownership, never
++// applies process-wide and has no presentation side effects of its own.
++//
+ // The policy is inert unless the command line contains
+ // `--browser-cli-background-presentation`, so stock Chromium behavior is
+ // unchanged.
+@@ -128,6 +138,12 @@ enum class BrowserCliPresentationState {
+   // user owns additionally answer internal requests, while automation origins
+   // stay denied.
+   kBackground,
++  // Per-window foreground assist lease of the window a decision is about
++  // (Phase 4 Slice 1). Like kHuman this is never applied process-wide: a
++  // leased window does not authorize any other window to present. Reported in
++  // decision logs via `state=`; use IsForegroundAssistLeased() to query it for
++  // a window id.
++  kAssist,
+   // Per-window USER_EXPLICIT/HUMAN ownership of the window a decision is
+   // about. This state is never applied process-wide: a `kHuman` window does
+   // not authorize any other window to present. Reported in decision logs via
+@@ -161,6 +177,14 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // must not show, minimize, re-show, restore, maximize, fullscreen,
+   // deactivate, move or resize a window the user owns (invariant 5.3).
+   //
++  // A window covered by a live foreground assist lease answers the lease's own
++  // show actions (kShowAndActivate / kShowInactive / kSetBounds) for
++  // kAgentAssist and every action for kInternal (native user flows), while
++  // extension / web page / session restore stay denied on it. Every other
++  // window keeps the background invariant, so one lease can never authorize a
++  // second window. A kUserExplicit request on a leased window releases the
++  // lease first and then grants per-window HUMAN ownership.
++  //
+   // Windows the user does not own keep the BACKGROUND invariant for every
+   // action and every non-user origin, with one proven exception: kSetBounds
+   // only changes the frame of a hidden managed window
+@@ -184,13 +208,65 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // Whether `window_id` is currently USER_EXPLICIT/HUMAN-owned.
+   bool IsUserExplicitOwned(uint64_t window_id) const;
+ 
++  // Requests a foreground assist lease for `window_id` on behalf of
++  // `requester_origin` (development plan section 6, Phase 4 Slice 1).
++  //
++  // The requester's origin is an explicit argument, never the ambient
++  // ScopedForegroundOrigin, so the check is deterministic and unit-testable;
++  // only ForegroundOrigin::kAgentAssist can ever be granted and every other
++  // origin is denied (fail closed). A HUMAN-owned target is always denied
++  // (invariant 5.3), and at most one lease exists per process (single
++  // instance): while a live lease covers another window the result is kBusy.
++  // A request for the window that already holds the lease is an idempotent
++  // kGranted that does not extend the deadline. In unmanaged mode this
++  // returns kDenied without logging, because stock Chromium has no assist.
++  //
++  // Slice 1 has no presentation side effects: this only records the lease,
++  // logs the transition and lets AllowPresentation() answer the lease-
++  // attributed show requests that a later producer slice will issue.
++  ForegroundAssistRequestResult RequestForegroundAssist(
++      ForegroundOrigin requester_origin,
++      uint64_t window_id,
++      uint64_t target_tab,
++      ForegroundAssistReason reason);
++
++  // Releases the lease covering `window_id` (agent hand-back, window
++  // destruction). No-op when the id holds no lease, in unmanaged mode, or
++  // after a user takeover (the takeover already released the lease and the
++  // window is HUMAN-owned). Never shows or hides anything.
++  void ReleaseForegroundAssist(uint64_t window_id,
++                               ForegroundAssistReleaseReason reason);
++
++  // Lazily releases an expired lease (reason=timeout) and returns how many
++  // were released. Slice 1 owns no timer; callers may use this entry point,
++  // and every decision/query below already sweeps expired leases first.
++  size_t ReleaseExpiredForegroundAssistLeases();
++
++  // Whether a live lease currently covers `window_id`. Sweeps expired leases
++  // first, so an expired lease never reports true.
++  bool IsForegroundAssistLeased(uint64_t window_id);
++
+   // Testing helpers. Reset restores the uninitialized (switch-driven) state.
+   void ResetForTesting();
+   void SetManagedModeEnabledForTesting(bool enabled);
++  // Pins the clock used for lazy lease expiry; null restores the real clock.
++  void SetNowForTesting(base::TimeTicks now) { now_for_testing_ = now; }
+   BrowserCliPresentationState state_for_testing() const { return state_; }
+   size_t user_explicit_owned_window_count_for_testing() const {
+     return user_explicit_owned_window_ids_.size();
+   }
++  size_t active_foreground_assist_lease_count_for_testing() const {
++    return active_foreground_assist_lease_.has_value() ? 1u : 0u;
++  }
++  const ForegroundLease* foreground_assist_lease_for_testing() const {
++    return active_foreground_assist_lease_
++               ? &active_foreground_assist_lease_.value()
++               : nullptr;
++  }
++  // Mirrors the `state=` field the decision log reports for `window_id`:
++  // kHuman for a USER_EXPLICIT-owned window, kAssist for a leased window.
++  // Sweeps expired leases first.
++  BrowserCliPresentationState window_state_for_testing(uint64_t window_id);
+ 
+  private:
+   friend class base::NoDestructor<BrowserCliPresentationPolicy>;
+@@ -203,9 +279,17 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+                    BrowserCliPresentationAction action,
+                    uint64_t window_id,
+                    bool owned,
++                   bool leased,
+                    bool allow,
+                    const char* reason);
+ 
++  // Releases the lease when it covers `window_id`, logging the transition.
++  void ReleaseForegroundAssistLocked(uint64_t window_id,
++                                     ForegroundAssistReleaseReason reason);
++  // Releases an expired lease, if any, and returns the number released.
++  size_t ReleaseExpiredForegroundAssistLeasesLocked();
++  base::TimeTicks Now() const;
++
+   bool initialized_ = false;
+   bool managed_mode_enabled_ = false;
+   BrowserCliPresentationState state_ = BrowserCliPresentationState::kUnmanaged;
+@@ -214,6 +298,13 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // Per-window USER_EXPLICIT/HUMAN ownership (see AllowPresentation). This is
+   // deliberately a set of window ids, not a process-wide boolean.
+   std::set<uint64_t> user_explicit_owned_window_ids_;
++
++  // The single foreground assist lease (Phase 4 Slice 1). At most one lease
++  // exists at a time; it authorizes only the show actions of its own window
++  // and never expands USER_EXPLICIT/HUMAN ownership.
++  std::optional<ForegroundLease> active_foreground_assist_lease_;
++  uint64_t assist_request_seq_ = 0;
++  base::TimeTicks now_for_testing_;
+ };
+ 
+ }  // namespace views
+diff --git a/ui/views/widget/browser_cli_presentation_policy_unittest.cc b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+index bd9dc71293..b48f0d85d1 100644
+--- a/ui/views/widget/browser_cli_presentation_policy_unittest.cc
++++ b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
++#include "base/time/time.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace views {
+@@ -26,6 +27,11 @@ constexpr ForegroundOrigin kAutomationOrigins[] = {
+     ForegroundOrigin::kAgentAssist, ForegroundOrigin::kExtension,
+     ForegroundOrigin::kWebPage, ForegroundOrigin::kSessionRestore};
+ 
++// Non-null epoch for the pinned test clock (lazy lease expiry).
++base::TimeTicks TestNow() {
++  return base::TimeTicks() + base::Minutes(1000);
++}
++
+ // Browser CLI tests for the per-window USER_EXPLICIT/HUMAN ownership model.
+ // The policy is a pure in-process state machine here: no native window is
+ // created and no command line switch is needed (managed mode is forced via
+@@ -50,6 +56,30 @@ class BrowserCliPresentationPolicyTest : public testing::Test {
+                          BrowserCliPresentationAction::kShowAndActivate) {
+     return Allow(ForegroundOrigin::kInternal, action, window_id);
+   }
++
++  // Foreground assist helpers. The clock is pinned so lazy lease expiry is
++  // deterministic; the ordered request decision itself is covered purely in
++  // browser_cli_foreground_lease_unittest.cc.
++  void EnableManagedModeAt(base::TimeTicks now) {
++    policy()->SetManagedModeEnabledForTesting(true);
++    policy()->SetNowForTesting(now);
++    now_ = now;
++  }
++
++  void AdvanceClock(base::TimeDelta delta) {
++    now_ += delta;
++    policy()->SetNowForTesting(now_);
++  }
++
++  ForegroundAssistRequestResult RequestAssist(
++      uint64_t window_id,
++      ForegroundAssistReason reason = ForegroundAssistReason::kLogin,
++      uint64_t target_tab = 0) {
++    return policy()->RequestForegroundAssist(ForegroundOrigin::kAgentAssist,
++                                             window_id, target_tab, reason);
++  }
++
++  base::TimeTicks now_;
+ };
+ 
+ TEST_F(BrowserCliPresentationPolicyTest, UnmanagedAllowsAndTracksNothing) {
+@@ -311,5 +341,301 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Foreground assist lease (Phase 4 Slice 1): single instance, per window,
++// lazy TTL expiry, HUMAN always wins. These tests use the pinned clock and the
++// policy state machine only: no window, no timer and no presentation happens.
++// ---------------------------------------------------------------------------
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistRequestOnlyAgentOriginCanBeGranted) {
++  EnableManagedModeAt(TestNow());
++
++  const ForegroundOrigin non_agent_origins[] = {
++      ForegroundOrigin::kUserExplicit, ForegroundOrigin::kExtension,
++      ForegroundOrigin::kWebPage, ForegroundOrigin::kInternal,
++      ForegroundOrigin::kSessionRestore};
++  for (ForegroundOrigin origin : non_agent_origins) {
++    EXPECT_EQ(policy()->RequestForegroundAssist(origin, /*window_id=*/20,
++                                                /*target_tab=*/0,
++                                                ForegroundAssistReason::kLogin),
++              ForegroundAssistRequestResult::kDenied)
++        << "origin=" << static_cast<int>(origin);
++  }
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++
++  EXPECT_EQ(RequestAssist(20, ForegroundAssistReason::kCaptcha,
++                          /*target_tab=*/3),
++            ForegroundAssistRequestResult::kGranted);
++  const ForegroundLease* lease =
++      policy()->foreground_assist_lease_for_testing();
++  ASSERT_NE(lease, nullptr);
++  EXPECT_EQ(lease->window_id, 20u);
++  EXPECT_EQ(lease->target_tab, 3u);
++  EXPECT_EQ(lease->reason, ForegroundAssistReason::kCaptcha);
++  EXPECT_EQ(lease->granted_at, now_);
++  EXPECT_EQ(lease->expires_at, now_ + kDefaultForegroundAssistLeaseTtl);
++  EXPECT_GT(lease->request_seq, 0u);
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 1u);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, AssistRequestInvalidTarget) {
++  EnableManagedModeAt(TestNow());
++
++  EXPECT_EQ(RequestAssist(/*window_id=*/0),
++            ForegroundAssistRequestResult::kInvalidTarget);
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(0));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistRequestDeniedForHumanOwnedTarget) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/30));
++
++  EXPECT_EQ(RequestAssist(30), ForegroundAssistRequestResult::kDenied);
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(30));
++  EXPECT_EQ(policy()->window_state_for_testing(30),
++            BrowserCliPresentationState::kHuman);
++  // The existing automation denial for a HUMAN-owned window is unchanged.
++  EXPECT_FALSE(Allow(ForegroundOrigin::kAgentAssist,
++                     BrowserCliPresentationAction::kShowAndActivate, 30));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, AssistHumanOwnedTargetWinsOverBusy) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/140));
++  ASSERT_EQ(RequestAssist(141), ForegroundAssistRequestResult::kGranted);
++
++  // HUMAN ownership is checked before the single-instance busy slot.
++  EXPECT_EQ(RequestAssist(140), ForegroundAssistRequestResult::kDenied);
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(140));
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(141));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, AssistRequestBusyForSecondWindow) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(40), ForegroundAssistRequestResult::kGranted);
++
++  EXPECT_EQ(RequestAssist(41), ForegroundAssistRequestResult::kBusy);
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(40));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(41));
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 1u);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistRequestSameWindowIsIdempotentWithoutExtendingDeadline) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(50, ForegroundAssistReason::kCaptcha,
++                          /*target_tab=*/3),
++            ForegroundAssistRequestResult::kGranted);
++  const ForegroundLease first =
++      *policy()->foreground_assist_lease_for_testing();
++
++  AdvanceClock(base::Minutes(1));
++  EXPECT_EQ(RequestAssist(50, ForegroundAssistReason::kConfirmation,
++                          /*target_tab=*/9),
++            ForegroundAssistRequestResult::kGranted);
++  const ForegroundLease* live = policy()->foreground_assist_lease_for_testing();
++  ASSERT_NE(live, nullptr);
++  // The idempotent re-request neither replaces nor extends the live lease.
++  EXPECT_EQ(live->window_id, first.window_id);
++  EXPECT_EQ(live->target_tab, first.target_tab);
++  EXPECT_EQ(live->reason, first.reason);
++  EXPECT_EQ(live->granted_at, first.granted_at);
++  EXPECT_EQ(live->expires_at, first.expires_at);
++  EXPECT_EQ(live->request_seq, first.request_seq);
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 1u);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistLeaseIsPerWindowAndNeverProcessWide) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(60), ForegroundAssistRequestResult::kGranted);
++
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(60));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(61));
++  // owned=yes stays reserved for HUMAN ownership; a lease never sets it.
++  EXPECT_FALSE(policy()->IsUserExplicitOwned(60));
++  // The browser mode stays background; only the decision's window is assist.
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kBackground);
++  EXPECT_EQ(policy()->window_state_for_testing(60),
++            BrowserCliPresentationState::kAssist);
++  EXPECT_EQ(policy()->window_state_for_testing(61),
++            BrowserCliPresentationState::kBackground);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistLeaseAllowsOnlyItsOwnShowActions) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(70), ForegroundAssistRequestResult::kGranted);
++
++  // Agent action allowlist: the lease grants the presentation it exists for,
++  // plus the proven non-presenting bounds change.
++  for (BrowserCliPresentationAction action : kAllActions) {
++    const bool expected_allow =
++        action == BrowserCliPresentationAction::kShowAndActivate ||
++        action == BrowserCliPresentationAction::kShowInactive ||
++        action == BrowserCliPresentationAction::kSetBounds;
++    EXPECT_EQ(Allow(ForegroundOrigin::kAgentAssist, action, 70), expected_allow)
++        << "action=" << static_cast<int>(action);
++  }
++  // Un-attributed internal requests (native user flows) keep working.
++  for (BrowserCliPresentationAction action : kAllActions) {
++    EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, 70))
++        << "action=" << static_cast<int>(action);
++  }
++  // The lease never lets another automation origin ride along.
++  const ForegroundOrigin other_automation[] = {
++      ForegroundOrigin::kExtension, ForegroundOrigin::kWebPage,
++      ForegroundOrigin::kSessionRestore};
++  for (ForegroundOrigin origin : other_automation) {
++    for (BrowserCliPresentationAction action : kAllActions) {
++      EXPECT_FALSE(Allow(origin, action, 70))
++          << "origin=" << static_cast<int>(origin)
++          << " action=" << static_cast<int>(action);
++    }
++  }
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistLeaseKeepsOtherWindowsInBackground) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(80), ForegroundAssistRequestResult::kGranted);
++
++  for (BrowserCliPresentationAction action : kAllActions) {
++    // The proven non-presenting bounds change stays allowed for every origin
++    // on an unleased window (unchanged background behavior); every other
++    // action is denied, for internal and agent alike.
++    const bool expected_allow =
++        action == BrowserCliPresentationAction::kSetBounds;
++    EXPECT_EQ(Allow(ForegroundOrigin::kInternal, action, 81), expected_allow)
++        << "action=" << static_cast<int>(action);
++    EXPECT_EQ(Allow(ForegroundOrigin::kAgentAssist, action, 81), expected_allow)
++        << "action=" << static_cast<int>(action);
++  }
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(81));
++  EXPECT_EQ(policy()->window_state_for_testing(81),
++            BrowserCliPresentationState::kBackground);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, AssistLeaseExpiresLazily) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(90), ForegroundAssistRequestResult::kGranted);
++
++  AdvanceClock(kDefaultForegroundAssistLeaseTtl - base::Milliseconds(1));
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(90));
++
++  // At the deadline the lease is expired: it reports unleased, the window is
++  // back to background and the agent can no longer present it.
++  AdvanceClock(base::Milliseconds(1));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(90));
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_EQ(policy()->window_state_for_testing(90),
++            BrowserCliPresentationState::kBackground);
++  EXPECT_FALSE(Allow(ForegroundOrigin::kAgentAssist,
++                     BrowserCliPresentationAction::kShowAndActivate, 90));
++
++  // The single slot is free again.
++  EXPECT_EQ(RequestAssist(91), ForegroundAssistRequestResult::kGranted);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistExplicitExpirySweepIsIdempotent) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(95), ForegroundAssistRequestResult::kGranted);
++
++  EXPECT_EQ(policy()->ReleaseExpiredForegroundAssistLeases(), 0u);
++  AdvanceClock(kDefaultForegroundAssistLeaseTtl);
++  EXPECT_EQ(policy()->ReleaseExpiredForegroundAssistLeases(), 1u);
++  EXPECT_EQ(policy()->ReleaseExpiredForegroundAssistLeases(), 0u);
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(95));
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistAgentReleaseRestoresBackgroundDenial) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(100), ForegroundAssistRequestResult::kGranted);
++
++  // Releasing an unrelated id is a no-op.
++  policy()->ReleaseForegroundAssist(
++      999, ForegroundAssistReleaseReason::kAgentRelease);
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(100));
++
++  policy()->ReleaseForegroundAssist(
++      100, ForegroundAssistReleaseReason::kAgentRelease);
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(100));
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_FALSE(Allow(ForegroundOrigin::kAgentAssist,
++                     BrowserCliPresentationAction::kShowAndActivate, 100));
++
++  // The window can be leased again afterwards.
++  EXPECT_EQ(RequestAssist(100), ForegroundAssistRequestResult::kGranted);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistUserTakeoverReleasesLeaseThenGrantsHuman) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(110), ForegroundAssistRequestResult::kGranted);
++
++  // A user takeover on the leased window wins: the lease is released first,
++  // then per-window HUMAN ownership is granted.
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate, 110));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(110));
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(110));
++  EXPECT_EQ(policy()->window_state_for_testing(110),
++            BrowserCliPresentationState::kHuman);
++  EXPECT_EQ(policy()->state_for_testing(),
++            BrowserCliPresentationState::kBackground);
++
++  // Automation stays denied on the HUMAN-owned window, and a late assist
++  // release can no longer touch it.
++  EXPECT_FALSE(Allow(ForegroundOrigin::kAgentAssist,
++                     BrowserCliPresentationAction::kShowAndActivate, 110));
++  policy()->ReleaseForegroundAssist(
++      110, ForegroundAssistReleaseReason::kAgentRelease);
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(110));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(110));
++  EXPECT_TRUE(AllowInternal(110));
++}
++
++TEST_F(BrowserCliPresentationPolicyTest, AssistWindowDestroyedReleasesLease) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(120), ForegroundAssistRequestResult::kGranted);
++
++  policy()->ReleaseForegroundAssist(
++      120, ForegroundAssistReleaseReason::kWindowDestroyed);
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(120));
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_FALSE(Allow(ForegroundOrigin::kAgentAssist,
++                     BrowserCliPresentationAction::kShowAndActivate, 120));
++  EXPECT_EQ(RequestAssist(121), ForegroundAssistRequestResult::kGranted);
++}
++
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistUnmanagedModeDeniesWithoutSideEffects) {
++  policy()->SetManagedModeEnabledForTesting(false);
++  policy()->SetNowForTesting(TestNow());
++
++  EXPECT_EQ(RequestAssist(130), ForegroundAssistRequestResult::kDenied);
++  EXPECT_EQ(policy()->active_foreground_assist_lease_count_for_testing(), 0u);
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(130));
++  EXPECT_EQ(policy()->ReleaseExpiredForegroundAssistLeases(), 0u);
++  policy()->ReleaseForegroundAssist(
++      130, ForegroundAssistReleaseReason::kAgentRelease);
++
++  // Stock Chromium behavior is untouched: every request is allowed.
++  EXPECT_TRUE(Allow(ForegroundOrigin::kAgentAssist,
++                    BrowserCliPresentationAction::kShowAndActivate, 130));
++}
++
+ }  // namespace
+ }  // namespace views

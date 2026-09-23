@@ -64,3 +64,17 @@ use_lld = false
 - **真实可见 App 启动未验收**（本阶段禁止桌面 UI，需用户明确授权的独立任务）。
 - 签名/封装/分发、Branding、launcher 均未做（Phase 9）。
 - 未开始 Phase 2；`chromium/patches/` 仍为空占位。
+
+## 更正（2026-09-22）：测试启动 Chrome 必须带 keychain/profile 隔离
+
+本文档记录的 `Chromium --version` smoke 在运行时**没有**加 `--use-mock-keychain`。
+`--version` 在 profile/钥匙串初始化之前就退出，当时未观察到弹窗，但这不符合 2026-09-22 起生效的
+强制测试卫生规则：
+
+- 任何测试/自动化启动 Chromium/Backlight 必须同时带 `--use-mock-keychain` 与
+  `mktemp -d` 的独立 `--user-data-dir`；
+- 禁止读写用户真实钥匙串、禁止任何系统对话框（flash 根因与完整规则见 `AGENTS.md` 与
+  `docs/phase2-background-presentation-2026-09-22.md` §9）；
+- `scripts/verify-phase1.sh` 的 smoke 已按此修正；生产运行不得使用 mock keychain。
+
+本更正不改变 Phase 1 的其他验收结论。

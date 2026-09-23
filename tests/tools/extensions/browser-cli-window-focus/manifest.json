@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Browser CLI Window Focus Test",
+  "version": "1.0",
+  "description": "Test-only fixture exercised by tests/phase2-extension-window-focus.sh: chrome.windows.create({focused:true}) and chrome.windows.update({focused:true}) under BACKGROUND.",
+  "permissions": ["tabs", "storage"],
+  "background": {
+    "service_worker": "sw.js"
+  }
+}

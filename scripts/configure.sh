@@ -9,7 +9,9 @@ usage() {
   cat <<'EOF'
 Usage: scripts/configure.sh [--dry-run] [--force] [--help]
 
-Copies chromium/args.gn to out/Dev/args.gn and runs `gn gen out/Dev`.
+Regenerates the macOS app icon assets from the approved source artwork
+(scripts/generate-icons.sh), copies chromium/args.gn to out/Dev/args.gn and
+runs `gn gen out/Dev`.
 
 Options:
   --dry-run  print commands without running them
@@ -35,6 +37,7 @@ ARGS_SRC="$BROWSER_CLI_ROOT/chromium/args.gn"
 [ -f "$ARGS_SRC" ] || die "missing $ARGS_SRC"
 
 if [ "$DRY_RUN" = "1" ]; then
+  printf '[dry-run] icons: %s --dry-run (regenerates chrome/app/theme/browser_cli/mac/{app.icns,Assets.car})\n' "$SCRIPT_DIR/generate-icons.sh"
   printf '[dry-run] args: %s -> %s/args.gn (force=%s)\n' "$ARGS_SRC" "$OUT_DIR" "$FORCE"
   printf '[dry-run] (cd %q && %q gen %q)\n' "$CHROMIUM_SRC" "$GN" "out/$OUT_NAME"
   printf '[dry-run] disk_now=%s GiB (min %s GiB); nothing executed\n' "$(disk_avail_gib)" "$DISK_MIN_GIB"
@@ -47,6 +50,10 @@ assert_single_out
 if [ ! -x "$GN" ]; then
   die "gn not found at $GN (run scripts/checkout.sh first)"
 fi
+
+# The branding patch selects chrome/app/theme/browser_cli/mac/{app.icns,Assets.car};
+# generate them from the approved source before gn gen checks for their existence.
+"$SCRIPT_DIR/generate-icons.sh"
 
 if [ -f "$OUT_DIR/args.gn" ] && ! diff -q "$ARGS_SRC" "$OUT_DIR/args.gn" >/dev/null 2>&1; then
   if [ "$FORCE" != "1" ]; then

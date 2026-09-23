@@ -1,0 +1,788 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 9c989a63ca..c35fa659d7 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1533,6 +1533,7 @@ source_set("core") {
+       "//chrome/app_shim",
+       "//chrome/browser/apps/app_shim",
+       "//chrome/browser/browser_cli:reopen_window_selection",
++      "//chrome/browser/browser_cli:user_explicit_presentation",
+       "//chrome/browser/enterprise/connectors/device_trust/key_management/core/mac",
+       "//chrome/browser/mac",
+       "//chrome/browser/mac:impl",
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 0db2aeba6a..81bade0851 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -42,7 +42,7 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/apps/app_shim/app_shim_termination_manager.h"
+ #include "chrome/browser/apps/platform_apps/app_window_registry_util.h"
+-#include "chrome/browser/browser_cli/reopen_window_selection.h"
++#include "chrome/browser/browser_cli/user_explicit_presentation.h"
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/browser_process_platform_part.h"
+@@ -152,7 +152,6 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/menus/cocoa/menu_controller.h"
+ #include "ui/native_theme/native_theme.h"
+-#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -265,80 +264,6 @@ void LaunchBrowserStartup(Profile* profile) {
+   return browser;
+ }
+ 
+-// Browser CLI: presents |browser|'s native window because the user explicitly
+-// asked for it (Dock / Launchpad / app reopen). Managed-mode detection and the
+-// presentation are both routed through NativeWidgetMacNSWindowHost (inside the
+-// ui/views component), so this file never reaches the presentation policy
+-// singleton directly and the process keeps exactly one policy state. The
+-// presentation is attributed USER_EXPLICIT and grants per-window HUMAN
+-// ownership to that one window; no other managed window is unsuppressed, so an
+-// agent/extension/web page/session restore can never ride along on the user's
+-// action. Returns whether the presentation was applied. In stock (unmanaged)
+-// Chromium this is a no-op because the window already showed itself and the
+-// check below is false.
+-bool PresentBrowserWindowUserExplicitly(BrowserWindowInterface* browser) {
+-  if (!views::NativeWidgetMacNSWindowHost::
+-          IsBrowserCliManagedPresentationEnabled()) {
+-    return false;
+-  }
+-  if (!browser || !browser->GetWindow()) {
+-    return false;
+-  }
+-  views::NativeWidgetMacNSWindowHost* host =
+-      views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
+-          browser->GetWindow()->GetNativeWindow());
+-  if (!host) {
+-    return false;
+-  }
+-  return host->PresentForUserExplicitAction();
+-}
+-
+-// Browser CLI: presents one existing browser window for an explicit user
+-// reopen (Dock / Launchpad / app reopen) while managed background presentation
+-// keeps every window hidden. Returns true when an existing window was
+-// presented; false means the caller should fall back to creating a new window
+-// (no reusable window exists, or managed mode is disabled).
+-bool PresentExistingBrowserWindowForUserExplicitReopen() {
+-  if (!views::NativeWidgetMacNSWindowHost::
+-          IsBrowserCliManagedPresentationEnabled()) {
+-    return false;
+-  }
+-
+-  // Candidates are collected in creation order (least recently created first),
+-  // which is stable and independent of activation history. Windows without a
+-  // native host cannot be presented and are skipped.
+-  std::vector<BrowserWindowInterface*> browsers;
+-  std::vector<browser_cli::ReopenWindowCandidate> candidates;
+-  GlobalBrowserCollection::GetInstance()->ForEach(
+-      [&browsers, &candidates](BrowserWindowInterface* browser) {
+-        if (!browser->GetWindow()) {
+-          return true;
+-        }
+-        views::NativeWidgetMacNSWindowHost* host =
+-            views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
+-                browser->GetWindow()->GetNativeWindow());
+-        if (!host) {
+-          return true;
+-        }
+-        browser_cli::ReopenWindowCandidate candidate;
+-        const BrowserWindowInterface::Type type = browser->GetType();
+-        candidate.is_reusable_browser_window =
+-            type != BrowserWindowInterface::TYPE_APP &&
+-            type != BrowserWindowInterface::TYPE_DEVTOOLS;
+-        candidate.is_user_owned = host->IsUserExplicitOwned();
+-        browsers.push_back(browser);
+-        candidates.push_back(candidate);
+-        return true;
+-      },
+-      BrowserCollection::Order::kCreation);
+-
+-  const size_t selected = browser_cli::SelectReopenWindowCandidate(candidates);
+-  if (selected == browser_cli::kNoReopenWindow) {
+-    return false;
+-  }
+-  return PresentBrowserWindowUserExplicitly(browsers[selected]);
+-}
+-
+ // Activates a browser window having the given profile (the last one active) if
+ // possible or creates an empty one if necessary. Returns a pointer to the
+ // activated/new |BrowserWindowInterface|.
+@@ -1976,7 +1901,7 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   // reopen must present one of the existing windows instead of unconditionally
+   // creating a new one; only when there is no reusable browser window does the
+   // normal new-window path below run. Stock Chromium is unaffected.
+-  if (PresentExistingBrowserWindowForUserExplicitReopen()) {
++  if (browser_cli::PresentExistingWindowForUserExplicitAction()) {
+     return NO;
+   }
+ 
+@@ -2024,7 +1949,8 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+           // Browser CLI: the new window was created in background and its
+           // internal show was denied; present it as the explicit user action
+           // that triggered this reopen.
+-          PresentBrowserWindowUserExplicitly(CreateBrowser(profile));
++          browser_cli::PresentBrowserForUserExplicitAction(
++              CreateBrowser(profile));
+         }),
+         app_controller_mac::kShowProfilePickerOnFailure);
+   }
+diff --git a/chrome/browser/browser_cli/BUILD.gn b/chrome/browser/browser_cli/BUILD.gn
+index 8d12e4fc88..067d69c54a 100644
+--- a/chrome/browser/browser_cli/BUILD.gn
++++ b/chrome/browser/browser_cli/BUILD.gn
+@@ -22,3 +22,50 @@ test("reopen_window_selection_unittests") {
+     "//testing/gtest",
+   ]
+ }
++
++source_set("user_explicit_show") {
++  sources = [
++    "user_explicit_show.cc",
++    "user_explicit_show.h",
++  ]
++  deps = [
++    "//base",
++    "//chrome/common:non_code_constants",
++    "//content/public/common",
++    "//ui/gfx:gfx_switches",
++  ]
++}
++
++test("user_explicit_show_unittests") {
++  sources = [ "user_explicit_show_unittest.cc" ]
++  deps = [
++    ":user_explicit_show",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//chrome/common:non_code_constants",
++    "//content/public/common",
++    "//testing/gtest",
++    "//ui/gfx:gfx_switches",
++  ]
++}
++
++if (is_mac) {
++  source_set("user_explicit_presentation") {
++    sources = [
++      "user_explicit_presentation.h",
++      "user_explicit_presentation.mm",
++    ]
++    deps = [
++      ":reopen_window_selection",
++      ":user_explicit_show",
++      "//base",
++      "//chrome/browser:browser_process",
++      "//chrome/browser/profiles:profile_manager",
++      "//chrome/browser/ui",
++      "//chrome/browser/ui/browser_window",
++      "//chrome/browser/ui/startup",
++      "//ui/views",
++    ]
++  }
++}
+diff --git a/chrome/browser/browser_cli/user_explicit_presentation.h b/chrome/browser/browser_cli/user_explicit_presentation.h
+new file mode 100644
+index 0000000000..45c8151a59
+--- /dev/null
++++ b/chrome/browser/browser_cli/user_explicit_presentation.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_PRESENTATION_H_
++#define CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_PRESENTATION_H_
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++
++class BrowserWindowInterface;
++
++namespace browser_cli {
++
++// Browser CLI shared explicit-user presentation helpers (macOS). This is the
++// single presentation path for Dock / Launchpad / app reopen and the CLI
++// explicit `show` producer; it never broadens automation origins and grants
++// per-window USER_EXPLICIT/HUMAN ownership only to the presented window.
++
++// Presents |browser|'s native window because the user explicitly asked for it.
++// Returns whether the presentation was applied; a no-op in stock (unmanaged)
++// Chromium.
++bool PresentBrowserForUserExplicitAction(BrowserWindowInterface* browser);
++
++// Presents one existing reusable browser window for an explicit user action,
++// preferring a window the user already owns. Returns true when an existing
++// window was presented; false means the caller should fall back to creating a
++// new window (no reusable window exists, or managed mode is disabled).
++bool PresentExistingWindowForUserExplicitAction();
++
++// Browser CLI explicit `show` producer. Handles a command line that may
++// carry `--browser-cli-user-explicit-show`, from either the cold-start path
++// (after the startup browser was created) or a forwarded ProcessSingleton
++// notification sent by a second direct binary invocation.
++//
++// Returns true when the request was consumed: an existing window was
++// presented, exactly one window was created and presented, or the request was
++// denied / failed (fail closed, with a structured log). Returns false when the
++// caller must continue ordinary command-line processing: the switch is absent,
++// the process is unmanaged, or the command line also carries launch arguments
++// (URL / `--app` / `--app-id` / `--incognito` / `--enable-automation` /
++// `--headless`) that must never be granted USER_EXPLICIT.
++bool HandleUserExplicitShowRequest(const base::CommandLine& command_line,
++                                   const base::FilePath& current_directory);
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_PRESENTATION_H_
+diff --git a/chrome/browser/browser_cli/user_explicit_presentation.mm b/chrome/browser/browser_cli/user_explicit_presentation.mm
+new file mode 100644
+index 0000000000..8d62708d37
+--- /dev/null
++++ b/chrome/browser/browser_cli/user_explicit_presentation.mm
+@@ -0,0 +1,226 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/user_explicit_presentation.h"
++
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/files/file_path.h"
++#include "base/logging.h"
++#include "base/notreached.h"
++#include "chrome/browser/browser_cli/reopen_window_selection.h"
++#include "chrome/browser/browser_cli/user_explicit_show.h"
++#include "chrome/browser/browser_process.h"
++#include "chrome/browser/profiles/profile_manager.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_collection.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "chrome/browser/ui/startup/startup_browser_creator.h"
++#include "ui/base/base_window.h"
++#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
++
++namespace browser_cli {
++namespace {
++
++// Structured producer log. `result` is handled / denied / failed / noop and
++// `reason` is the stable machine-readable outcome reason; the presentation
++// policy adds its own BROWSER_CLI_PRESENTATION decision log for every actual
++// request, so an allow/deny pair can always be correlated.
++void LogProducerOutcome(const char* result,
++                        const char* reason,
++                        bool managed_mode) {
++  LOG(INFO) << "BROWSER_CLI_USER_EXPLICIT_SHOW stage=producer"
++            << " result=" << result << " reason=" << reason
++            << " managed=" << (managed_mode ? "yes" : "no");
++}
++
++// Presents |browser|'s native window because the user explicitly asked for it.
++// Managed-mode detection and the presentation are both routed through
++// NativeWidgetMacNSWindowHost (inside the ui/views component), so this file
++// never reaches the presentation policy singleton directly and the process
++// keeps exactly one policy state. The presentation is attributed USER_EXPLICIT
++// and grants per-window HUMAN ownership to that one window; no other managed
++// window is unsuppressed, so an agent/extension/web page/session restore can
++// never ride along on the user's action. Returns whether the presentation was
++// applied. In stock (unmanaged) Chromium this is a no-op because the window
++// already showed itself and the check below is false.
++bool PresentBrowserWindowUserExplicitly(BrowserWindowInterface* browser) {
++  if (!views::NativeWidgetMacNSWindowHost::
++          IsBrowserCliManagedPresentationEnabled()) {
++    return false;
++  }
++  if (!browser || !browser->GetWindow()) {
++    return false;
++  }
++  views::NativeWidgetMacNSWindowHost* host =
++      views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++          browser->GetWindow()->GetNativeWindow());
++  if (!host) {
++    return false;
++  }
++  return host->PresentForUserExplicitAction();
++}
++
++// Returns the window a user-explicit presentation should pick, or nullptr when
++// no reusable window exists. Candidates are collected in creation order (least
++// recently created first), which is stable and independent of activation
++// history; managed mode suppresses activation, so activation order would be
++// unreliable. Nothing is presented here, which keeps this a pure lookup.
++BrowserWindowInterface* FindReusableWindowForUserExplicitAction() {
++  if (!g_browser_process) {
++    return nullptr;
++  }
++
++  // Windows without a native host cannot be presented and are skipped.
++  std::vector<BrowserWindowInterface*> browsers;
++  std::vector<ReopenWindowCandidate> candidates;
++  GlobalBrowserCollection::GetInstance()->ForEach(
++      [&browsers, &candidates](BrowserWindowInterface* browser) {
++        if (!browser->GetWindow()) {
++          return true;
++        }
++        views::NativeWidgetMacNSWindowHost* host =
++            views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++                browser->GetWindow()->GetNativeWindow());
++        if (!host) {
++          return true;
++        }
++        ReopenWindowCandidate candidate;
++        const BrowserWindowInterface::Type type = browser->GetType();
++        candidate.is_reusable_browser_window =
++            type != BrowserWindowInterface::TYPE_APP &&
++            type != BrowserWindowInterface::TYPE_DEVTOOLS;
++        candidate.is_user_owned = host->IsUserExplicitOwned();
++        browsers.push_back(browser);
++        candidates.push_back(candidate);
++        return true;
++      },
++      BrowserCollection::Order::kCreation);
++
++  const size_t selected = SelectReopenWindowCandidate(candidates);
++  if (selected == kNoReopenWindow) {
++    return nullptr;
++  }
++  return browsers[selected];
++}
++
++// Resolves the profile an explicit show may create a window in. Only an
++// already-loaded profile can be used synchronously: the profile picker is
++// never shown and a profile is never loaded asynchronously for a show request,
++// so this fails closed with nullptr instead.
++Profile* ResolveLoadedProfileForUserExplicitShow(
++    const base::CommandLine& command_line,
++    const base::FilePath& current_directory) {
++  ProfileManager* profile_manager =
++      g_browser_process ? g_browser_process->profile_manager() : nullptr;
++  if (!profile_manager) {
++    return nullptr;
++  }
++  const StartupProfilePathInfo path_info = GetStartupProfilePath(
++      current_directory, command_line, /*ignore_profile_picker=*/true);
++  if (path_info.mode != StartupProfileMode::kBrowserWindow) {
++    return nullptr;
++  }
++  return profile_manager->GetProfileByPath(path_info.path);
++}
++
++// Creates exactly one empty window for `profile` and presents it. Session
++// restore is explicitly disabled and the scripted creation returns the created
++// window (or nullptr on failure), so a failed creation can never present an
++// unrelated window that happens to be the most recent one.
++bool CreateAndPresentWindowForUserExplicitAction(Profile* profile) {
++  if (!profile) {
++    return false;
++  }
++  BrowserWindowInterface* created = chrome::OpenEmptyWindow(
++      profile, /*should_trigger_session_restore=*/false);
++  return PresentBrowserWindowUserExplicitly(created);
++}
++
++}  // namespace
++
++bool PresentBrowserForUserExplicitAction(BrowserWindowInterface* browser) {
++  return PresentBrowserWindowUserExplicitly(browser);
++}
++
++bool PresentExistingWindowForUserExplicitAction() {
++  if (!views::NativeWidgetMacNSWindowHost::
++          IsBrowserCliManagedPresentationEnabled()) {
++    return false;
++  }
++  return PresentBrowserWindowUserExplicitly(
++      FindReusableWindowForUserExplicitAction());
++}
++
++bool HandleUserExplicitShowRequest(const base::CommandLine& command_line,
++                                   const base::FilePath& current_directory) {
++  const UserExplicitShowRequestClass request_class =
++      ClassifyUserExplicitShowRequest(command_line);
++  if (request_class == UserExplicitShowRequestClass::kNotRequested) {
++    return false;
++  }
++
++  const bool managed_mode = views::NativeWidgetMacNSWindowHost::
++      IsBrowserCliManagedPresentationEnabled();
++
++  // Only a pure show request in managed mode looks for an existing window;
++  // every other case must not touch the collection.
++  BrowserWindowInterface* reusable =
++      request_class == UserExplicitShowRequestClass::kShow && managed_mode
++          ? FindReusableWindowForUserExplicitAction()
++          : nullptr;
++
++  switch (
++      PlanUserExplicitShow(request_class, managed_mode, reusable != nullptr)) {
++    case UserExplicitShowPlan::kNoAction:
++      if (request_class ==
++          UserExplicitShowRequestClass::kBlockedByLaunchArguments) {
++        // Never ride a URL / app / incognito launch into a USER_EXPLICIT
++        // presentation. The caller continues ordinary command-line processing,
++        // which creates only background-managed windows.
++        LogProducerOutcome("denied", "launch-arguments-not-user-explicit",
++                           managed_mode);
++      } else {
++        // Stock Chromium already presents its own windows; the producer must
++        // not add a duplicate visibility path or a duplicate window.
++        LogProducerOutcome("noop", "unmanaged-stock-behavior", managed_mode);
++      }
++      return false;
++
++    case UserExplicitShowPlan::kPresentExistingWindow:
++      if (PresentBrowserWindowUserExplicitly(reusable)) {
++        LogProducerOutcome("handled", "existing-window-presented",
++                           managed_mode);
++      } else {
++        // Do not fall through to create: an existing window exists, so
++        // creating another one would violate "exactly one reusable window".
++        LogProducerOutcome("failed", "existing-window-presentation-denied",
++                           managed_mode);
++      }
++      return true;
++
++    case UserExplicitShowPlan::kCreateWindowThenPresent: {
++      Profile* profile = ResolveLoadedProfileForUserExplicitShow(
++          command_line, current_directory);
++      if (!profile) {
++        LogProducerOutcome("failed", "profile-not-loaded", managed_mode);
++        return true;
++      }
++      if (CreateAndPresentWindowForUserExplicitAction(profile)) {
++        LogProducerOutcome("handled", "window-created-and-presented",
++                           managed_mode);
++      } else {
++        LogProducerOutcome("failed", "window-creation-or-presentation-denied",
++                           managed_mode);
++      }
++      return true;
++    }
++  }
++
++  NOTREACHED();
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/user_explicit_show.cc b/chrome/browser/browser_cli/user_explicit_show.cc
+new file mode 100644
+index 0000000000..3a094408b8
+--- /dev/null
++++ b/chrome/browser/browser_cli/user_explicit_show.cc
+@@ -0,0 +1,51 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/user_explicit_show.h"
++
++#include "chrome/common/chrome_switches.h"
++#include "content/public/common/content_switches.h"
++#include "ui/gfx/switches.h"
++
++namespace browser_cli {
++
++UserExplicitShowRequestClass ClassifyUserExplicitShowRequest(
++    const base::CommandLine& command_line) {
++  if (!command_line.HasSwitch(kBrowserCliUserExplicitShowSwitch)) {
++    return UserExplicitShowRequestClass::kNotRequested;
++  }
++  // Positional arguments are URLs. `--app` and `--app-id` launch app windows,
++  // `--incognito` launches an off-the-record window, and `--enable-automation`
++  // or `--headless` mark automated / headless launches. None of them is a
++  // pure "show what is already there" request, so they must not be granted
++  // USER_EXPLICIT presentation; an automated or headless launch must never
++  // present a window.
++  if (!command_line.GetArgs().empty() ||
++      command_line.HasSwitch(switches::kApp) ||
++      command_line.HasSwitch(switches::kAppId) ||
++      command_line.HasSwitch(switches::kIncognito) ||
++      command_line.HasSwitch(switches::kEnableAutomation) ||
++      command_line.HasSwitch(switches::kHeadless)) {
++    return UserExplicitShowRequestClass::kBlockedByLaunchArguments;
++  }
++  return UserExplicitShowRequestClass::kShow;
++}
++
++UserExplicitShowPlan PlanUserExplicitShow(
++    UserExplicitShowRequestClass request_class,
++    bool managed_mode_enabled,
++    bool has_reusable_window) {
++  if (request_class != UserExplicitShowRequestClass::kShow) {
++    return UserExplicitShowPlan::kNoAction;
++  }
++  if (!managed_mode_enabled) {
++    // Stock Chromium already presents its own windows; the producer must not
++    // add a duplicate visibility path or a duplicate window.
++    return UserExplicitShowPlan::kNoAction;
++  }
++  return has_reusable_window ? UserExplicitShowPlan::kPresentExistingWindow
++                             : UserExplicitShowPlan::kCreateWindowThenPresent;
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/user_explicit_show.h b/chrome/browser/browser_cli/user_explicit_show.h
+new file mode 100644
+index 0000000000..81decdd1e8
+--- /dev/null
++++ b/chrome/browser/browser_cli/user_explicit_show.h
+@@ -0,0 +1,73 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_SHOW_H_
++#define CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_SHOW_H_
++
++#include "base/command_line.h"
++
++namespace browser_cli {
++
++// Command-line switch of the Browser CLI explicit `show` producer. The switch
++// is only set by a separately launched Browser CLI binary invocation: either
++// the cold-start argv of this process or the argv forwarded by a second
++// invocation through ProcessSingleton. Renderers, extensions, web pages and
++// browser-internal code never produce it, so a command line carrying it can be
++// attributed to the user and granted USER_EXPLICIT presentation.
++inline constexpr char kBrowserCliUserExplicitShowSwitch[] =
++    "browser-cli-user-explicit-show";
++
++// Classification of one command line for the explicit `show` producer. Pure,
++// so the cold-start path and the forwarded-notification path share exactly one
++// decision and unit tests need no browser process.
++enum class UserExplicitShowRequestClass {
++  // The switch is absent: ordinary, stock command-line processing.
++  kNotRequested,
++  // The switch is present and the command line carries no launch arguments
++  // (no URL, `--app`, `--app-id`, `--incognito`, `--enable-automation` or
++  // `--headless`): a pure explicit show.
++  kShow,
++  // The switch is present but the command line also launches something (a URL,
++  // an app window, an incognito window) or marks an automated / headless
++  // launch. Such a request must never be granted USER_EXPLICIT; it falls back
++  // to ordinary command-line processing, which keeps the window in the
++  // background.
++  kBlockedByLaunchArguments,
++};
++
++// How the explicit `show` producer must act on a classified request. Pure and
++// deterministic for unit testing. `has_reusable_window` reports whether
++// SelectReopenWindowCandidate() found an existing window that can be presented.
++enum class UserExplicitShowPlan {
++  // Do not touch presentation: no show was requested, the process is
++  // unmanaged (stock Chromium already presents its own windows), or the
++  // request was blocked and must be handled as an ordinary command line.
++  kNoAction,
++  // Present the existing reusable window through the single per-window
++  // USER_EXPLICIT/HUMAN presentation path.
++  kPresentExistingWindow,
++  // Create exactly one empty window for the resolved already-loaded profile
++  // (no profile picker, no session restore) and present it.
++  kCreateWindowThenPresent,
++};
++
++// Returns kShow only for a pure explicit show request. Anything that also
++// launches a URL, an app window or an incognito window, or that marks an
++// automated (`--enable-automation`) / headless (`--headless`) launch, is
++// classified as kBlockedByLaunchArguments, so those command lines can never
++// ride along into an explicit presentation.
++UserExplicitShowRequestClass ClassifyUserExplicitShowRequest(
++    const base::CommandLine& command_line);
++
++// Maps a classified request and the producer's environment to the one action
++// to take. In unmanaged mode the plan is always kNoAction: it must not add a
++// duplicate visibility path or a duplicate window to stock Chromium.
++UserExplicitShowPlan PlanUserExplicitShow(
++    UserExplicitShowRequestClass request_class,
++    bool managed_mode_enabled,
++    bool has_reusable_window);
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_USER_EXPLICIT_SHOW_H_
+diff --git a/chrome/browser/browser_cli/user_explicit_show_unittest.cc b/chrome/browser/browser_cli/user_explicit_show_unittest.cc
+new file mode 100644
+index 0000000000..f38c6f8a02
+--- /dev/null
++++ b/chrome/browser/browser_cli/user_explicit_show_unittest.cc
+@@ -0,0 +1,125 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/user_explicit_show.h"
++
++#include "base/command_line.h"
++#include "chrome/common/chrome_switches.h"
++#include "content/public/common/content_switches.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/switches.h"
++
++namespace browser_cli {
++namespace {
++
++base::CommandLine ShowCommandLine() {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++  return command_line;
++}
++
++TEST(UserExplicitShowRequestTest, NoSwitchIsNotRequested) {
++  const base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kNotRequested);
++}
++
++TEST(UserExplicitShowRequestTest, PlainSwitchIsShow) {
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(ShowCommandLine()),
++            UserExplicitShowRequestClass::kShow);
++}
++
++TEST(UserExplicitShowRequestTest, SupportingSwitchesKeepShow) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitch("no-startup-window");
++  command_line.AppendSwitch("browser-cli-background-presentation");
++  command_line.AppendSwitchASCII("user-data-dir", "/tmp/browser-cli-profile");
++  command_line.AppendSwitchASCII("profile-directory", "Default");
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kShow);
++}
++
++TEST(UserExplicitShowRequestTest, UrlArgumentIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendArg("https://example.com/");
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowRequestTest, AppSwitchIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitchASCII(switches::kApp, "https://example.com/");
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowRequestTest, AppIdSwitchIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitchASCII(switches::kAppId, "abcdefghijklmnop");
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowRequestTest, IncognitoSwitchIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitch(switches::kIncognito);
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowRequestTest, EnableAutomationSwitchIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitch(switches::kEnableAutomation);
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowRequestTest, HeadlessSwitchIsBlocked) {
++  base::CommandLine command_line = ShowCommandLine();
++  command_line.AppendSwitch(switches::kHeadless);
++  EXPECT_EQ(ClassifyUserExplicitShowRequest(command_line),
++            UserExplicitShowRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(UserExplicitShowPlanTest, NotRequestedIsNoAction) {
++  EXPECT_EQ(PlanUserExplicitShow(UserExplicitShowRequestClass::kNotRequested,
++                                 /*managed_mode_enabled=*/true,
++                                 /*has_reusable_window=*/true),
++            UserExplicitShowPlan::kNoAction);
++}
++
++TEST(UserExplicitShowPlanTest, BlockedLaunchArgumentsAreNoAction) {
++  EXPECT_EQ(PlanUserExplicitShow(
++                UserExplicitShowRequestClass::kBlockedByLaunchArguments,
++                /*managed_mode_enabled=*/true, /*has_reusable_window=*/true),
++            UserExplicitShowPlan::kNoAction);
++}
++
++TEST(UserExplicitShowPlanTest, UnmanagedModeIsNoAction) {
++  EXPECT_EQ(PlanUserExplicitShow(UserExplicitShowRequestClass::kShow,
++                                 /*managed_mode_enabled=*/false,
++                                 /*has_reusable_window=*/false),
++            UserExplicitShowPlan::kNoAction);
++  EXPECT_EQ(PlanUserExplicitShow(UserExplicitShowRequestClass::kShow,
++                                 /*managed_mode_enabled=*/false,
++                                 /*has_reusable_window=*/true),
++            UserExplicitShowPlan::kNoAction);
++}
++
++TEST(UserExplicitShowPlanTest, ManagedModePresentsExistingWindow) {
++  EXPECT_EQ(PlanUserExplicitShow(UserExplicitShowRequestClass::kShow,
++                                 /*managed_mode_enabled=*/true,
++                                 /*has_reusable_window=*/true),
++            UserExplicitShowPlan::kPresentExistingWindow);
++}
++
++TEST(UserExplicitShowPlanTest, ManagedModeCreatesWindowWithoutReusableWindow) {
++  EXPECT_EQ(PlanUserExplicitShow(UserExplicitShowRequestClass::kShow,
++                                 /*managed_mode_enabled=*/true,
++                                 /*has_reusable_window=*/false),
++            UserExplicitShowPlan::kCreateWindowThenPresent);
++}
++
++}  // namespace
++}  // namespace browser_cli
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index b2619baa8f..55dd86bb63 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -221,6 +221,7 @@
+ #if BUILDFLAG(IS_MAC)
+ #include <Security/Security.h>
+ 
++#include "chrome/browser/browser_cli/user_explicit_presentation.h"
+ #include "chrome/browser/infobars/browser_infobar_manager.h"
+ #include "chrome/browser/infobars/infobar_features.h"
+ #include "chrome/browser/mac/chrome_browser_main_extra_parts_mac.h"
+@@ -556,6 +557,17 @@ void ProcessSingletonNotificationCallbackImpl(
+   }
+ #endif
+ 
++#if BUILDFLAG(IS_MAC)
++  // Browser CLI: a direct binary invocation carrying the explicit `show`
++  // switch is handled by the shared producer instead of ordinary command-line
++  // processing, so an existing window is presented and no duplicate window is
++  // created. Every other command line falls through to stock handling.
++  if (browser_cli::HandleUserExplicitShowRequest(command_line,
++                                                 current_directory)) {
++    return;
++  }
++#endif
++
+   StartupProfilePathInfo startup_profile_path_info =
+       GetStartupProfilePath(current_directory, command_line,
+                             /*ignore_profile_picker=*/false);
+@@ -2124,6 +2136,16 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   if (browser_creator_->Start(*base::CommandLine::ForCurrentProcess(),
+                               base::FilePath(), profile_info,
+                               last_opened_profiles)) {
++#if BUILDFLAG(IS_MAC)
++    // Browser CLI: a cold start carrying the explicit `show` switch presents
++    // exactly one window. The startup path has already created its window (its
++    // native show was denied by the background policy); with
++    // --no-startup-window no window exists yet and the producer creates one for
++    // the resolved profile. Ordinary background starts never reach this call.
++    browser_cli::HandleUserExplicitShowRequest(
++        *base::CommandLine::ForCurrentProcess(), base::FilePath());
++#endif
++
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
+     // Initialize autoupdate timer. Timer callback costs basically nothing
+     // when browser is not in persistent mode, so it's OK to let it ride on

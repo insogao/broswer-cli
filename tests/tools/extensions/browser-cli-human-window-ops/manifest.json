@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Browser CLI HUMAN Window Ops (manual)",
+  "version": "1.0",
+  "description": "Manual evidence fixture for tests/phase3-human-ownership-manual.sh: run Extension API window ops against the user's HUMAN-owned window and report results to the local sink.",
+  "permissions": ["tabs", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "action": {
+    "default_title": "Browser CLI HUMAN window ops"
+  }
+}

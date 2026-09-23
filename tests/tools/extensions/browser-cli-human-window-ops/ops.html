@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>BCLI_HUMAN_OPS</title>
+    <style>
+      body { font: 13px -apple-system, sans-serif; margin: 16px; }
+      button { margin: 2px; }
+      #out { margin-top: 10px; white-space: pre-wrap; }
+      .ok { color: #0a0; }
+      .err { color: #a00; }
+    </style>
+  </head>
+  <body>
+    <h1>Browser CLI HUMAN window ops (manual)</h1>
+    <p>
+      Open this page as a tab <b>in the window you took over</b> (the HUMAN
+      window), press <b>Detect HUMAN window</b>, then run each op and observe
+      that the browser does not let the extension steal/move your window.
+    </p>
+    <div>
+      <button id="detect">Detect HUMAN window</button>
+      <button id="activate">activate (focused:true)</button>
+      <button id="deactivate">deactivate (focused:false)</button>
+      <button id="minimize">minimize</button>
+      <button id="maximize">maximize</button>
+      <button id="restore">restore</button>
+      <button id="fullscreen-on">fullscreen on</button>
+      <button id="fullscreen-off">fullscreen off</button>
+      <button id="bounds">bounds move/resize</button>
+    </div>
+    <div>
+      <button id="create-window">create background Window (focused:false)</button>
+      <button id="create-tab">create background Tab (active:false)</button>
+      <button id="send">Send all results to sink</button>
+    </div>
+    <div id="out">(no ops yet)</div>
+    <script src="ops.js"></script>
+  </body>
+</html>

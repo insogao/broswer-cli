@@ -4,17 +4,26 @@
 # Steps:
 #   0. config consistency: chromium/args.gn == out/Dev/args.gn; checkout HEAD must
 #      equal the chromium/VERSION revision (mismatch is FAIL unless --allow-tip)
-#   1. artifacts: Chromium.app binary/framework/Info.plist, arm64, codesign structure
-#   2. no-UI smoke: `Chromium.app/Contents/MacOS/Chromium --version` (bounded, no `open`)
+#   1. artifacts: product app binary/framework/Info.plist, arm64
+#   2. no-UI smoke: `<Product>.app/Contents/MacOS/<Product> --version
+#      --use-mock-keychain --user-data-dir=<mktemp -d>` (bounded, no `open`).
+#      The app must already carry the pinned Developer ID signature; ad-hoc
+#      builds are never launched/tested (see AGENTS.md).
 #   3. empty incremental: ninja -> expect "no work to do"
 #   4. real C++ incremental: temporary static_assert probe, rebuild, exact restore
-#      via `git cat-file blob HEAD:<file>`, rebuild, confirm clean tree + no work
+#      via `git cat-file blob HEAD:<file>`, rebuild, probe-file diff check
+#   5. mandatory product signing + signature acceptance after all builds
+#
+# The checkout is expected to contain the browser-cli patch series
+# (chromium/patches/*.patch, uncommitted by design), so global "git status must
+# be clean" checks are scoped to the probe file.
 #
 # Never uses `git reset --hard` or `git checkout --`; never launches visible UI.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/lib/common.sh"
+load_product_identity
 
 usage() {
   cat <<'EOF'
@@ -63,11 +72,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-APP_DIR="$OUT_DIR/Chromium.app"
-APP_BIN="$APP_DIR/Contents/MacOS/Chromium"
+APP_DIR="$PRODUCT_APP_DIR"
+APP_BIN="$PRODUCT_APP_BIN"
 INFO_PLIST="$APP_DIR/Contents/Info.plist"
-FRAMEWORK_VERSIONS="$APP_DIR/Contents/Frameworks/Chromium Framework.framework/Versions"
-FRAMEWORK_BIN="$(find "$FRAMEWORK_VERSIONS" -maxdepth 2 -name "Chromium Framework" -type f 2>/dev/null | head -1 || true)"
+FRAMEWORK_VERSIONS="$APP_DIR/Contents/Frameworks/$BROWSER_CLI_PRODUCT_NAME Framework.framework/Versions"
+FRAMEWORK_BIN="$(find "$FRAMEWORK_VERSIONS" -maxdepth 2 -name "$BROWSER_CLI_PRODUCT_NAME Framework" -type f 2>/dev/null | head -1 || true)"
 EXPECTED_VERSION="$(awk -F= '$1 == "version" {print $2}' "$BROWSER_CLI_ROOT/chromium/VERSION")"
 PINNED_REV="$(pinned_revision || true)"
 
@@ -77,13 +86,17 @@ if [ "$DRY_RUN" = "1" ]; then
   0. compare $BROWSER_CLI_ROOT/chromium/args.gn with out/$OUT_NAME/args.gn
      and require checkout HEAD == chromium/VERSION revision ($PINNED_REV);
      HEAD mismatch is FAIL by default (--allow-tip=$ALLOW_TIP opt-out for tip builds)
-  1. artifact checks: $APP_DIR (binary, framework, Info.plist=$EXPECTED_VERSION, arm64, codesign -dv)
-  2. smoke (skipped=$SKIP_SMOKE, timeout=${SMOKE_TIMEOUT}s):
-     "$APP_BIN" --version   # no "open"/Dock/Launchpad, no window, residual-process check after
+  1. artifact checks: $APP_DIR (binary, framework, Info.plist=$EXPECTED_VERSION, arm64)
+  2. smoke (skipped=$SKIP_SMOKE, timeout=${SMOKE_TIMEOUT}s), only for a
+     Developer-ID-signed app (team $BROWSER_CLI_TEAM_ID; ad-hoc is refused):
+     "$APP_BIN" --version --use-mock-keychain --user-data-dir=<mktemp -d>
+     # no "open"/Dock/Launchpad, no window, no keychain/system dialog, no profile reuse;
+     # residual-process check after
   3. empty incremental: ninja -C out/$OUT_NAME -j $BUILD_JOBS chrome  (expect "no work to do")
   4. incremental probe (skipped=$SKIP_INCREMENTAL) on $PROBE_REL:
      append static_assert -> ninja -> count edges -> restore via
-     \`git cat-file blob HEAD:$PROBE_REL\` -> verify clean -> ninja -> expect "no work to do"
+     \`git cat-file blob HEAD:$PROBE_REL\` -> verify probe unchanged -> ninja -> expect "no work to do"
+  5. mandatory signing + acceptance: scripts/sign-browser-cli.sh && scripts/verify-signature.sh
   check-only mode: $CHECK_ONLY (step 0 only, read-only)
 [dry-run] nothing executed
 EOF
@@ -103,6 +116,7 @@ note() { printf '%s\n' "$*" | tee -a "$NOTE_LOG"; }
 
 PROBE_APPLIED=0
 TMP_BACKUP=""
+SMOKE_PROFILE=""
 restore_probe_on_exit() {
   local rc=$?
   if [ "${PROBE_APPLIED:-0}" = "1" ]; then
@@ -113,6 +127,9 @@ restore_probe_on_exit() {
       fi
     fi
     PROBE_APPLIED=0
+  fi
+  if [ -n "$SMOKE_PROFILE" ] && [ -d "$SMOKE_PROFILE" ]; then
+    rm -rf "$SMOKE_PROFILE"
   fi
   exit "$rc"
 }
@@ -187,13 +204,22 @@ if lipo -info "$FRAMEWORK_BIN" 2>/dev/null | grep -q "arm64"; then
 else
   die "framework binary is not arm64"
 fi
-HELPER_APP="$(find "$APP_DIR/Contents/Frameworks" -maxdepth 6 -name "Chromium Helper (Renderer).app" 2>/dev/null | head -1 || true)"
+HELPER_APP="$(find "$APP_DIR/Contents/Frameworks" -maxdepth 6 -name "$BROWSER_CLI_PRODUCT_NAME Helper (Renderer).app" 2>/dev/null | head -1 || true)"
 [ -n "$HELPER_APP" ] && note "PASS  helper app present: $(basename "$HELPER_APP")"
-if codesign -dv "$APP_DIR" 2>&1 | grep -q "Signature=adhoc"; then
-  note "PASS  codesign structure: adhoc/linker-signed (unsigned dev build; sealing is Phase 9)"
-else
-  note "INFO  codesign -dv did not report an adhoc signature (inspect manually)"
-fi
+# No ad-hoc build may be launched or tested. The app must already be signed by
+# the pinned Developer ID identity (scripts/build.sh does this automatically).
+SIG_INFO="$(codesign -dv --verbose=4 "$APP_DIR" 2>&1 || true)"
+case "$SIG_INFO" in
+  *"TeamIdentifier=$BROWSER_CLI_TEAM_ID"*)
+    note "PASS  signature: Developer ID (team $BROWSER_CLI_TEAM_ID)"
+    ;;
+  *"Signature=adhoc"*)
+    die "app is ad-hoc signed; ad-hoc builds are never testable. Run scripts/build.sh (mandatory signing)."
+    ;;
+  *)
+    die "app signature is not the pinned Developer ID identity; run scripts/build.sh"
+    ;;
+esac
 
 # ---------------------------------------------------------------- step 2
 if [ "$SKIP_SMOKE" = "1" ]; then
@@ -203,10 +229,14 @@ else
   step "step 2: no-UI smoke (--version)"
   SMOKE_OUT="$(mktemp)"
   SMOKE_ERR="$(mktemp)"
+  # Mandatory test hygiene: isolated throwaway profile + mock keychain. The
+  # keychain must never be touched by tests ("Chromium Safe Storage" prompt;
+  # see AGENTS.md). The app is already Developer-ID-signed (checked in step 1).
+  SMOKE_PROFILE="$(mktemp -d "${TMPDIR:-/tmp}/browser-cli-verify-profile.XXXXXX")"
   SMOKE_START="$(date +%s)"
   SMOKE_RC=0
   SMOKE_WAITED=0
-  "$APP_BIN" --version >"$SMOKE_OUT" 2>"$SMOKE_ERR" &
+  "$APP_BIN" --version --use-mock-keychain --user-data-dir="$SMOKE_PROFILE" >"$SMOKE_OUT" 2>"$SMOKE_ERR" &
   SMOKE_PID=$!
   while kill -0 "$SMOKE_PID" 2>/dev/null; do
     if [ "$SMOKE_WAITED" -ge "$SMOKE_TIMEOUT" ]; then
@@ -287,8 +317,9 @@ else
   PROBE_APPLIED=0
   AFTER_SHA="$(git -C "$CHROMIUM_SRC" hash-object "$PROBE_ABS")"
   [ "$AFTER_SHA" = "$BEFORE_SHA" ] || die "restore mismatch: $AFTER_SHA != $BEFORE_SHA"
-  [ -z "$(git -C "$CHROMIUM_SRC" status --porcelain)" ] || die "checkout not clean after restore"
-  note "PASS  restore exact (blob $AFTER_SHA) and git status clean"
+  [ -z "$(git -C "$CHROMIUM_SRC" status --porcelain -- "$PROBE_REL")" ] || die "probe file not clean after restore"
+  note "PASS  restore exact (blob $AFTER_SHA); probe file unchanged"
+  note "INFO  checkout stays patch-dirty by design (chromium/patches/*.patch are applied, uncommitted)"
 
   RESTORE_LOG="$LOG_DIR/verify-restore-$(date +%Y%m%d-%H%M%S).log"
   RESTORE_START="$(date +%s)"
@@ -308,8 +339,17 @@ else
   else
     note "WARN  final rc=0 without 'no work to do'; see $FINAL_LOG"
   fi
-  [ -z "$(git -C "$CHROMIUM_SRC" status --porcelain)" ] || die "checkout not clean at the end"
+  [ -z "$(git -C "$CHROMIUM_SRC" status --porcelain -- "$PROBE_REL")" ] || die "probe file dirty at the end"
 fi
+
+# ---------------------------------------------------------------- step 5
+# Mandatory: any build performed above leaves ad-hoc linker signatures, so the
+# product must be re-signed and accepted before this run can pass. Ad-hoc builds
+# must never be kept or claimed testable (see AGENTS.md).
+step "step 5: mandatory product signing + signature acceptance"
+"$SCRIPT_DIR/sign-browser-cli.sh"
+"$SCRIPT_DIR/verify-signature.sh"
+note "PASS  product signed with the pinned Developer ID identity and accepted"
 
 step "summary"
 note "verify-phase1 completed; note log: $NOTE_LOG"

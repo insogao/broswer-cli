@@ -1,0 +1,1682 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index c35fa659d7..551dd223f5 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1532,6 +1532,8 @@ source_set("core") {
+       ":shutdown_watchdog_mac",
+       "//chrome/app_shim",
+       "//chrome/browser/apps/app_shim",
++      "//chrome/browser/browser_cli:foreground_assist",
++      "//chrome/browser/browser_cli:foreground_assist_presentation",
+       "//chrome/browser/browser_cli:reopen_window_selection",
+       "//chrome/browser/browser_cli:user_explicit_presentation",
+       "//chrome/browser/enterprise/connectors/device_trust/key_management/core/mac",
+diff --git a/chrome/browser/browser_cli/BUILD.gn b/chrome/browser/browser_cli/BUILD.gn
+index 067d69c54a..d468d2d42e 100644
+--- a/chrome/browser/browser_cli/BUILD.gn
++++ b/chrome/browser/browser_cli/BUILD.gn
+@@ -36,6 +36,29 @@ source_set("user_explicit_show") {
+   ]
+ }
+ 
++source_set("foreground_assist") {
++  sources = [
++    "foreground_assist.cc",
++    "foreground_assist.h",
++  ]
++  deps = [
++    ":user_explicit_show",
++    "//base",
++    "//chrome/common:non_code_constants",
++    "//content/public/common",
++    "//ui/gfx:gfx_switches",
++    "//ui/views",
++  ]
++}
++
++source_set("foreground_assist_controller") {
++  sources = [
++    "foreground_assist_controller.cc",
++    "foreground_assist_controller.h",
++  ]
++  deps = [ "//base" ]
++}
++
+ test("user_explicit_show_unittests") {
+   sources = [ "user_explicit_show_unittest.cc" ]
+   deps = [
+@@ -50,6 +73,33 @@ test("user_explicit_show_unittests") {
+   ]
+ }
+ 
++test("foreground_assist_unittests") {
++  sources = [ "foreground_assist_unittest.cc" ]
++  deps = [
++    ":foreground_assist",
++    ":user_explicit_show",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//chrome/common:non_code_constants",
++    "//content/public/common",
++    "//testing/gtest",
++    "//ui/gfx:gfx_switches",
++    "//ui/views",
++  ]
++}
++
++test("foreground_assist_controller_unittests") {
++  sources = [ "foreground_assist_controller_unittest.cc" ]
++  deps = [
++    ":foreground_assist_controller",
++    "//base",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
++
+ if (is_mac) {
+   source_set("user_explicit_presentation") {
+     sources = [
+@@ -57,6 +107,7 @@ if (is_mac) {
+       "user_explicit_presentation.mm",
+     ]
+     deps = [
++      ":foreground_assist_presentation",
+       ":reopen_window_selection",
+       ":user_explicit_show",
+       "//base",
+@@ -68,4 +119,18 @@ if (is_mac) {
+       "//ui/views",
+     ]
+   }
++
++  source_set("foreground_assist_presentation") {
++    sources = [
++      "foreground_assist_presentation.h",
++      "foreground_assist_presentation.mm",
++    ]
++    deps = [
++      ":foreground_assist",
++      ":foreground_assist_controller",
++      "//base",
++      "//chrome/browser/ui/browser_window",
++      "//ui/views",
++    ]
++  }
+ }
+diff --git a/chrome/browser/browser_cli/foreground_assist.cc b/chrome/browser/browser_cli/foreground_assist.cc
+new file mode 100644
+index 0000000000..b12b0e1f03
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist.cc
+@@ -0,0 +1,199 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/foreground_assist.h"
++
++#include <optional>
++#include <string>
++
++#include "chrome/browser/browser_cli/user_explicit_show.h"
++#include "chrome/common/chrome_switches.h"
++#include "content/public/common/content_switches.h"
++#include "ui/gfx/switches.h"
++
++namespace browser_cli {
++namespace {
++
++// Strict positive decimal uint64 parsing: no sign, no whitespace, no empty
++// string, no overflow, no zero. Window and tab ids are plain decimal numbers
++// in the producer contract.
++std::optional<uint64_t> ParsePositiveUint64(const std::string& value) {
++  if (value.empty()) {
++    return std::nullopt;
++  }
++  uint64_t result = 0;
++  for (char c : value) {
++    if (c < '0' || c > '9') {
++      return std::nullopt;
++    }
++    const uint64_t digit = static_cast<uint64_t>(c - '0');
++    if (result > (UINT64_MAX - digit) / 10) {
++      return std::nullopt;
++    }
++    result = result * 10 + digit;
++  }
++  if (result == 0) {
++    return std::nullopt;
++  }
++  return result;
++}
++
++std::optional<views::ForegroundAssistReason> ParseReason(
++    const std::string& value) {
++  if (value == "login") {
++    return views::ForegroundAssistReason::kLogin;
++  }
++  if (value == "captcha") {
++    return views::ForegroundAssistReason::kCaptcha;
++  }
++  if (value == "confirmation") {
++    return views::ForegroundAssistReason::kConfirmation;
++  }
++  if (value == "other") {
++    return views::ForegroundAssistReason::kOther;
++  }
++  return std::nullopt;
++}
++
++// Launch switches that must never be granted an assist lease. This is the
++// same fail-closed set the explicit show producer refuses.
++bool HasBlockingLaunchArguments(const base::CommandLine& command_line) {
++  return !command_line.GetArgs().empty() ||
++         command_line.HasSwitch(switches::kApp) ||
++         command_line.HasSwitch(switches::kAppId) ||
++         command_line.HasSwitch(switches::kIncognito) ||
++         command_line.HasSwitch(switches::kEnableAutomation) ||
++         command_line.HasSwitch(switches::kHeadless);
++}
++
++// Whether |switch_name| belongs to the blocked launch-argument set. Used by the
++// cold-start sanitizer to drop exactly the switches the classifier refuses.
++bool IsBlockingLaunchSwitch(const std::string& switch_name) {
++  return switch_name == switches::kApp || switch_name == switches::kAppId ||
++         switch_name == switches::kIncognito ||
++         switch_name == switches::kEnableAutomation ||
++         switch_name == switches::kHeadless;
++}
++
++}  // namespace
++
++bool ForegroundAssistRequestClassConsumesCommandLine(
++    ForegroundAssistRequestClass request_class) {
++  // Any assist intent (valid or blocked) is consumed by the producer; only a
++  // command line without the assist switches may continue as an ordinary
++  // launch.
++  return request_class != ForegroundAssistRequestClass::kNotRequested;
++}
++
++bool HasForegroundAssistIntent(const base::CommandLine& command_line) {
++  return command_line.HasSwitch(kBrowserCliForegroundAssistSwitch) ||
++         command_line.HasSwitch(kBrowserCliForegroundAssistReleaseSwitch);
++}
++
++base::CommandLine CommandLineForColdStartStartup(
++    const base::CommandLine& command_line) {
++  if (!HasForegroundAssistIntent(command_line)) {
++    // Ordinary (non-assist) startup: byte-identical copy, nothing changes.
++    return command_line;
++  }
++  // An assist invocation must never be processed by the ordinary startup as a
++  // URL / app / incognito / automation / headless launch. Copy every switch
++  // except the blocked launch set (positional URL arguments are dropped by
++  // construction) and force background mode, so StartupBrowserCreator only
++  // brings up the process and never opens a window or the profile picker.
++  base::CommandLine sanitized(base::CommandLine::NO_PROGRAM);
++  for (const auto& [name, value] : command_line.GetSwitches()) {
++    if (IsBlockingLaunchSwitch(name)) {
++      continue;
++    }
++    if (value.empty()) {
++      sanitized.AppendSwitch(name);
++    } else {
++      sanitized.AppendSwitchASCII(name, value);
++    }
++  }
++  sanitized.AppendSwitch(switches::kNoStartupWindow);
++  return sanitized;
++}
++
++ForegroundAssistRequestClass ClassifyForegroundAssistRequest(
++    const base::CommandLine& command_line,
++    ForegroundAssistRequest* request) {
++  const bool requests_lease =
++      command_line.HasSwitch(kBrowserCliForegroundAssistSwitch);
++  const bool requests_release =
++      command_line.HasSwitch(kBrowserCliForegroundAssistReleaseSwitch);
++  if (!requests_lease && !requests_release) {
++    return ForegroundAssistRequestClass::kNotRequested;
++  }
++  if (requests_lease && requests_release) {
++    return ForegroundAssistRequestClass::kBlockedByConflictingSwitches;
++  }
++  // A user-explicit show must never be combined with an agent assist request:
++  // the user's action owns the foreground.
++  if (command_line.HasSwitch(kBrowserCliUserExplicitShowSwitch)) {
++    return ForegroundAssistRequestClass::kBlockedByConflictingSwitches;
++  }
++  if (HasBlockingLaunchArguments(command_line)) {
++    return ForegroundAssistRequestClass::kBlockedByLaunchArguments;
++  }
++
++  // Tab-level targeting is not implemented: a present tab switch is rejected
++  // (malformed values as an invalid target, valid non-zero values as an
++  // unsupported target) so a request can never claim a tab was granted.
++  if (command_line.HasSwitch(kBrowserCliForegroundAssistTabSwitch)) {
++    if (!ParsePositiveUint64(command_line.GetSwitchValueASCII(
++            kBrowserCliForegroundAssistTabSwitch))) {
++      return ForegroundAssistRequestClass::kBlockedByInvalidTarget;
++    }
++    return ForegroundAssistRequestClass::kBlockedByUnsupportedTabTarget;
++  }
++
++  // A release only needs a valid target window; an optional reason must still
++  // be one of the fixed vocabulary values.
++  if (requests_release) {
++    if (command_line.HasSwitch(kBrowserCliForegroundAssistReasonSwitch) &&
++        !ParseReason(command_line.GetSwitchValueASCII(
++            kBrowserCliForegroundAssistReasonSwitch))) {
++      return ForegroundAssistRequestClass::kBlockedByInvalidReason;
++    }
++    if (!command_line.HasSwitch(kBrowserCliForegroundAssistWindowSwitch)) {
++      return ForegroundAssistRequestClass::kBlockedByInvalidTarget;
++    }
++    const std::optional<uint64_t> window =
++        ParsePositiveUint64(command_line.GetSwitchValueASCII(
++            kBrowserCliForegroundAssistWindowSwitch));
++    if (!window) {
++      return ForegroundAssistRequestClass::kBlockedByInvalidTarget;
++    }
++    request->target_window = *window;
++    return ForegroundAssistRequestClass::kReleaseLease;
++  }
++
++  // A request needs both a valid reason and a valid target window.
++  if (!command_line.HasSwitch(kBrowserCliForegroundAssistReasonSwitch)) {
++    return ForegroundAssistRequestClass::kBlockedByInvalidReason;
++  }
++  const std::optional<views::ForegroundAssistReason> reason =
++      ParseReason(command_line.GetSwitchValueASCII(
++          kBrowserCliForegroundAssistReasonSwitch));
++  if (!reason) {
++    return ForegroundAssistRequestClass::kBlockedByInvalidReason;
++  }
++  if (!command_line.HasSwitch(kBrowserCliForegroundAssistWindowSwitch)) {
++    return ForegroundAssistRequestClass::kBlockedByInvalidTarget;
++  }
++  const std::optional<uint64_t> window =
++      ParsePositiveUint64(command_line.GetSwitchValueASCII(
++          kBrowserCliForegroundAssistWindowSwitch));
++  if (!window) {
++    return ForegroundAssistRequestClass::kBlockedByInvalidTarget;
++  }
++  request->target_window = *window;
++  request->target_tab = 0;
++  request->reason = *reason;
++  return ForegroundAssistRequestClass::kRequestLease;
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist.h b/chrome/browser/browser_cli/foreground_assist.h
+new file mode 100644
+index 0000000000..787460ae79
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist.h
+@@ -0,0 +1,110 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_H_
++#define CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_H_
++
++#include <stdint.h>
++
++#include "base/command_line.h"
++#include "ui/views/widget/browser_cli_foreground_lease.h"
++
++namespace browser_cli {
++
++// Command-line switches of the Browser CLI agent foreground-assist producer.
++// They are only set by a separately launched Browser CLI binary invocation
++// (cold-start argv or a second invocation forwarded through ProcessSingleton).
++// Renderers, extensions, web pages and browser-internal code never produce
++// them, so a command line carrying them can be attributed to the agent and,
++// after strict validation, request or release a per-window assist lease.
++inline constexpr char kBrowserCliForegroundAssistSwitch[] =
++    "browser-cli-foreground-assist";
++inline constexpr char kBrowserCliForegroundAssistReleaseSwitch[] =
++    "browser-cli-foreground-assist-release";
++inline constexpr char kBrowserCliForegroundAssistReasonSwitch[] =
++    "browser-cli-foreground-assist-reason";
++inline constexpr char kBrowserCliForegroundAssistWindowSwitch[] =
++    "browser-cli-foreground-assist-window";
++inline constexpr char kBrowserCliForegroundAssistTabSwitch[] =
++    "browser-cli-foreground-assist-tab";
++
++// Classification of one command line for the agent foreground-assist producer.
++// Pure, so the cold-start path and the forwarded-notification path share
++// exactly one decision and unit tests need no browser process.
++enum class ForegroundAssistRequestClass {
++  // Neither the request nor the release switch is present.
++  kNotRequested,
++  // A lease request with a valid reason and target window.
++  kRequestLease,
++  // A release request with a valid target window.
++  kReleaseLease,
++  // The command line also launches something (URL, `--app`, `--app-id`,
++  // `--incognito`) or marks an automated (`--enable-automation`) / headless
++  // (`--headless`) launch. Such a command line must never be granted an assist
++  // lease, and it is consumed so it can never act as an ordinary launch either.
++  kBlockedByLaunchArguments,
++  // The reason switch is missing or not one of the fixed vocabulary values.
++  kBlockedByInvalidReason,
++  // The target window is missing, zero or not a plain decimal uint64.
++  kBlockedByInvalidTarget,
++  // A tab switch is present. Tab-level targeting is not implemented in this
++  // slice (the lease only records an audit value and never selects a tab), so
++  // a command line that names a tab is rejected instead of silently pretending
++  // the tab was granted.
++  kBlockedByUnsupportedTabTarget,
++  // Contradictory producers: the request and release switch together, or an
++  // agent assist combined with the user-explicit show switch.
++  kBlockedByConflictingSwitches,
++};
++
++// A validated assist request. Only filled when the classification is
++// kRequestLease or kReleaseLease. target_tab stays 0: the classifier rejects
++// every tab switch (kBlockedByUnsupportedTabTarget), so no request can claim a
++// tab target.
++struct ForegroundAssistRequest {
++  uint64_t target_window = 0;
++  uint64_t target_tab = 0;
++  views::ForegroundAssistReason reason = views::ForegroundAssistReason::kOther;
++};
++
++// Whether a classified command line must be consumed instead of falling
++// through to ordinary command-line processing (which would open a URL / app
++// window or otherwise act as a normal launch). Only kNotRequested returns
++// false; every assist intent, including a blocked one, is consumed and logged
++// by the producer so an agent invocation can never turn into an ordinary
++// launch that changes a HUMAN-owned window or creates a visible window.
++bool ForegroundAssistRequestClassConsumesCommandLine(
++    ForegroundAssistRequestClass request_class);
++
++// Whether |command_line| carries any assist intent (the request or the release
++// switch). Matches exactly the classifier's entry condition: a command line
++// with only the auxiliary assist switches is kNotRequested and has no intent.
++bool HasForegroundAssistIntent(const base::CommandLine& command_line);
++
++// The command line the cold-start startup (`StartupBrowserCreator::Start`) must
++// use:
++//   * without an assist intent: an unchanged copy of |command_line|;
++//   * with an assist intent: a copy with every positional URL argument and the
++//     blocked launch switches (--app / --app-id / --incognito /
++//     --enable-automation / --headless) removed and `--no-startup-window`
++//     added. The ordinary startup then only brings up the browser process
++//     (silent_launch; it never opens a URL, app window or profile picker), and
++//     the assist handler denies and logs the original request.
++// |command_line| itself is never modified. The cold-start call site must pass
++// the returned value to StartupBrowserCreator::Start().
++base::CommandLine CommandLineForColdStartStartup(
++    const base::CommandLine& command_line);
++
++// Classifies |command_line| and, for kRequestLease / kReleaseLease, fills
++// |request|. Everything else fails closed: an assist request can never ride a
++// URL / app / incognito / automated / headless launch, an invalid reason or an
++// invalid target, a tab target (unsupported), and it can never be combined
++// with the user-explicit show switch (the user action owns the foreground).
++ForegroundAssistRequestClass ClassifyForegroundAssistRequest(
++    const base::CommandLine& command_line,
++    ForegroundAssistRequest* request);
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_H_
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller.cc b/chrome/browser/browser_cli/foreground_assist_controller.cc
+new file mode 100644
+index 0000000000..0be9e42a46
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_controller.cc
+@@ -0,0 +1,98 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/foreground_assist_controller.h"
++
++#include "base/check.h"
++#include "base/location.h"
++
++namespace browser_cli {
++
++ForegroundAssistController::ForegroundAssistController(
++    Delegate* delegate,
++    base::TimeDelta lease_ttl)
++    : delegate_(delegate), lease_ttl_(lease_ttl) {
++  DCHECK(delegate_);
++  DCHECK_GT(lease_ttl_, base::TimeDelta());
++}
++
++ForegroundAssistController::~ForegroundAssistController() = default;
++
++void ForegroundAssistController::OnLeaseGranted(uint64_t window_id) {
++  DCHECK_NE(window_id, 0u);
++  if (tracked_window_ == window_id) {
++    // Idempotent re-request: keep the original deadline, exactly like the
++    // policy keeps the original lease.
++    return;
++  }
++  // The single lease slot is free again (otherwise the policy would have
++  // answered kBusy), so the previously tracked window must already be hidden
++  // or was never shown; return it to the background before tracking the new
++  // one so no stale assist window can stay visible.
++  FinalizeTrackedWindow();
++  tracked_window_ = window_id;
++  lease_timer_.Start(FROM_HERE, lease_ttl_, this,
++                     &ForegroundAssistController::OnLeaseTimeout);
++}
++
++void ForegroundAssistController::OnLeaseReleasedByAgent(uint64_t window_id) {
++  CancelTrackingForWindow(window_id);
++}
++
++void ForegroundAssistController::OnLeaseReleasedByUserTakeover(
++    uint64_t window_id) {
++  // The policy released the lease for this window before granting HUMAN; the
++  // timer must not survive the takeover, otherwise the original deadline could
++  // hide the window after the user hands it back.
++  CancelTrackingForWindow(window_id);
++}
++
++void ForegroundAssistController::CancelTrackingForWindow(uint64_t window_id) {
++  if (tracked_window_ == 0 || tracked_window_ != window_id) {
++    return;
++  }
++  lease_timer_.Stop();
++  tracked_window_ = 0;
++}
++
++void ForegroundAssistController::OnLeaseTimeout() {
++  const uint64_t window_id = tracked_window_;
++  tracked_window_ = 0;
++  if (window_id == 0) {
++    return;
++  }
++  // The lease was already released (agent release, user takeover, window
++  // destruction) or the window is gone: the timeout must not touch anything.
++  if (!delegate_->WindowExists(window_id)) {
++    return;
++  }
++  // Invariant 5.3: the user's window is never hidden by automation.
++  if (delegate_->WindowIsUserOwned(window_id)) {
++    return;
++  }
++  delegate_->ReleaseLeaseForTimeout(window_id);
++  delegate_->ReturnWindowToBackground(window_id);
++}
++
++void ForegroundAssistController::FinalizeTrackedWindow() {
++  if (tracked_window_ == 0) {
++    return;
++  }
++  const uint64_t previous = tracked_window_;
++  tracked_window_ = 0;
++  lease_timer_.Stop();
++  if (!delegate_->WindowExists(previous)) {
++    return;
++  }
++  if (delegate_->WindowIsUserOwned(previous)) {
++    return;
++  }
++  // The previous lease is already gone from the policy; this release is a
++  // no-op that only guarantees the timeout log exists for the old window if
++  // the lazy sweep has not run yet.
++  delegate_->ReleaseLeaseForTimeout(previous);
++  delegate_->ReturnWindowToBackground(previous);
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller.h b/chrome/browser/browser_cli/foreground_assist_controller.h
+new file mode 100644
+index 0000000000..beae8c9e79
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_controller.h
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_CONTROLLER_H_
++#define CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_CONTROLLER_H_
++
++#include <stdint.h>
++
++#include "base/memory/raw_ptr.h"
++#include "base/time/time.h"
++#include "base/timer/timer.h"
++
++namespace browser_cli {
++
++// Browser CLI foreground assist timeout owner (Phase 4 Slice 2).
++//
++// The policy (ui/views) records the single per-window lease and its deadline;
++// this controller owns the only timer that turns an expired lease into a
++// return-to-background for exactly that window. It never decides presentation
++// itself: every effect goes through the Delegate, whose production
++// implementation routes to NativeWidgetMacNSWindowHost (the single
++// presentation gateway). A window the user owns (HUMAN) is never released or
++// hidden by the timeout path, and a lease that was already released (agent
++// release, user takeover, window destruction) makes the timer a no-op.
++//
++// UI-thread only, like the policy.
++class ForegroundAssistController {
++ public:
++  // The effects the controller may cause. Kept free of ui/views types so the
++  // timeout logic is unit-testable without a browser process or a window.
++  class Delegate {
++   public:
++    virtual ~Delegate() = default;
++
++    // Whether a managed window with |window_id| still exists.
++    virtual bool WindowExists(uint64_t window_id) = 0;
++    // Whether the user owns (HUMAN) the window. Never hide such a window.
++    virtual bool WindowIsUserOwned(uint64_t window_id) = 0;
++    // Policy release with reason=timeout. No-op when the lease is already gone
++    // (lazy sweep, agent release, takeover, destruction).
++    virtual void ReleaseLeaseForTimeout(uint64_t window_id) = 0;
++    // Return exactly this window to the background (hide). Never called for a
++    // HUMAN-owned or destroyed window.
++    virtual void ReturnWindowToBackground(uint64_t window_id) = 0;
++  };
++
++  ForegroundAssistController(Delegate* delegate, base::TimeDelta lease_ttl);
++  ForegroundAssistController(const ForegroundAssistController&) = delete;
++  ForegroundAssistController& operator=(const ForegroundAssistController&) =
++      delete;
++  ~ForegroundAssistController();
++
++  // Called after the policy granted a lease for |window_id|. Starts the TTL
++  // timer. An idempotent re-request for the window that is already tracked
++  // keeps the original deadline (the policy does not extend it either). A
++  // grant for a different window first returns the previously tracked window
++  // to the background: the single lease slot was already free, so the previous
++  // window must not stay visible behind the new one.
++  void OnLeaseGranted(uint64_t window_id);
++
++  // Agent-initiated release: the caller performs the policy release and hide;
++  // this only stops the timer so the timeout cannot fire for a lease that is
++  // already gone. Only cancels tracking when |window_id| is the tracked window.
++  void OnLeaseReleasedByAgent(uint64_t window_id);
++
++  // USER_EXPLICIT takeover (ASSIST -> HUMAN): the policy has already released
++  // the lease for |window_id|. Cancel the tracking and the pending timeout
++  // explicitly so the original deadline can never fire for a window the user
++  // owns (or has handed back before the deadline). Only the tracked window is
++  // affected. Callers must invoke this on every USER_EXPLICIT takeover of a
++  // window, not rely on the defensive ownership checks in OnLeaseTimeout().
++  void OnLeaseReleasedByUserTakeover(uint64_t window_id);
++
++  bool IsTrackingWindowForTesting() const { return tracked_window_ != 0; }
++  uint64_t tracked_window_for_testing() const { return tracked_window_; }
++
++ private:
++  void OnLeaseTimeout();
++  void FinalizeTrackedWindow();
++  void CancelTrackingForWindow(uint64_t window_id);
++
++  raw_ptr<Delegate> delegate_;
++  const base::TimeDelta lease_ttl_;
++  base::OneShotTimer lease_timer_;
++  uint64_t tracked_window_ = 0;
++};
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_CONTROLLER_H_
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc b/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc
+new file mode 100644
+index 0000000000..abb2a9f52d
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc
+@@ -0,0 +1,186 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/foreground_assist_controller.h"
++
++#include <set>
++#include <vector>
++
++#include "base/test/task_environment.h"
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace browser_cli {
++namespace {
++
++constexpr base::TimeDelta kTestTtl = base::Seconds(30);
++
++class FakeDelegate : public ForegroundAssistController::Delegate {
++ public:
++  bool WindowExists(uint64_t window_id) override {
++    return existing.count(window_id) > 0;
++  }
++  bool WindowIsUserOwned(uint64_t window_id) override {
++    return user_owned.count(window_id) > 0;
++  }
++  void ReleaseLeaseForTimeout(uint64_t window_id) override {
++    released.push_back(window_id);
++  }
++  void ReturnWindowToBackground(uint64_t window_id) override {
++    returned_to_background.push_back(window_id);
++  }
++
++  std::set<uint64_t> existing;
++  std::set<uint64_t> user_owned;
++  std::vector<uint64_t> released;
++  std::vector<uint64_t> returned_to_background;
++};
++
++class ForegroundAssistControllerTest : public testing::Test {
++ protected:
++  base::test::TaskEnvironment task_environment_{
++      base::test::TaskEnvironment::TimeSource::MOCK_TIME};
++  FakeDelegate delegate_;
++  ForegroundAssistController controller_{&delegate_, kTestTtl};
++};
++
++TEST_F(ForegroundAssistControllerTest,
++       TimeoutReturnsOnlyTheTrackedWindowToBackground) {
++  delegate_.existing = {7, 8};
++  controller_.OnLeaseGranted(7);
++  EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
++
++  task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++
++  // The timeout fires exactly once.
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released.size(), 1u);
++  EXPECT_EQ(delegate_.returned_to_background.size(), 1u);
++}
++
++TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForAWindowTheUserOwns) {
++  delegate_.existing = {7};
++  delegate_.user_owned = {7};
++  controller_.OnLeaseGranted(7);
++
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++}
++
++TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForADestroyedWindow) {
++  // No window exists: destruction already released the lease and hid nothing.
++  controller_.OnLeaseGranted(7);
++
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++}
++
++TEST_F(ForegroundAssistControllerTest,
++       NewGrantFinalizesThePreviouslyTrackedWindow) {
++  delegate_.existing = {7, 8};
++  controller_.OnLeaseGranted(7);
++  task_environment_.FastForwardBy(base::Milliseconds(5));
++
++  // The single lease slot was already free for window 8, so window 7 must be
++  // returned to the background before window 8 is tracked.
++  controller_.OnLeaseGranted(8);
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_EQ(controller_.tracked_window_for_testing(), 8u);
++
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7, 8}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7, 8}));
++}
++
++TEST_F(ForegroundAssistControllerTest,
++       AgentReleaseStopsTheTimerWithoutTouchingTheWindow) {
++  delegate_.existing = {7};
++  controller_.OnLeaseGranted(7);
++  controller_.OnLeaseReleasedByAgent(7);
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++
++  // The agent release path performs the policy release and hide itself; the
++  // timeout must not repeat either effect.
++  task_environment_.FastForwardBy(kTestTtl * 2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++}
++
++TEST_F(ForegroundAssistControllerTest,
++       AgentReleaseForAnotherWindowKeepsTracking) {
++  delegate_.existing = {7, 8};
++  controller_.OnLeaseGranted(7);
++  controller_.OnLeaseReleasedByAgent(8);
++
++  EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++}
++
++// ASSIST -> HUMAN: the takeover cancels the pending timeout explicitly. Without
++// this, a user who hands the window back before the original deadline would
++// have the stale timer hide the window.
++TEST_F(ForegroundAssistControllerTest, UserTakeoverCancelsThePendingTimeout) {
++  delegate_.existing = {7};
++  controller_.OnLeaseGranted(7);
++  controller_.OnLeaseReleasedByUserTakeover(7);
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++
++  // The user hands the window back (no longer user-owned), then the original
++  // deadline passes: nothing may be released or hidden.
++  delegate_.user_owned.clear();
++  task_environment_.FastForwardBy(kTestTtl * 2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++}
++
++TEST_F(ForegroundAssistControllerTest,
++       UserTakeoverForAnotherWindowKeepsTracking) {
++  delegate_.existing = {7, 8};
++  controller_.OnLeaseGranted(7);
++  controller_.OnLeaseReleasedByUserTakeover(8);
++  EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
++
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++}
++
++TEST_F(ForegroundAssistControllerTest,
++       IdempotentGrantKeepsTheOriginalDeadline) {
++  delegate_.existing = {7};
++  controller_.OnLeaseGranted(7);
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  controller_.OnLeaseGranted(7);
++
++  // Half a TTL is left; a restarted timer would still be pending here.
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++}
++
++TEST_F(ForegroundAssistControllerTest, TimeoutNeverTouchesOtherWindows) {
++  delegate_.existing = {7, 8, 9};
++  controller_.OnLeaseGranted(8);
++  task_environment_.FastForwardBy(kTestTtl);
++
++  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({8}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({8}));
++}
++
++}  // namespace
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist_presentation.h b/chrome/browser/browser_cli/foreground_assist_presentation.h
+new file mode 100644
+index 0000000000..5017b6e442
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_presentation.h
+@@ -0,0 +1,46 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_PRESENTATION_H_
++#define CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_PRESENTATION_H_
++
++#include "base/command_line.h"
++#include "chrome/browser/browser_cli/foreground_assist_controller.h"
++
++namespace browser_cli {
++
++// Browser CLI agent foreground-assist producer (macOS). Handles a command line
++// that may carry the request or release switches from either the cold-start
++// path or a forwarded ProcessSingleton notification.
++//
++// The producer never presents anything by itself: it strictly classifies the
++// command line (fail closed on launch arguments, invalid reason or target,
++// unsupported tab targets, and conflicting producer switches), asks the
++// presentation policy for the lease through NativeWidgetMacNSWindowHost, and
++// only presents the target window after the policy granted the lease. The
++// target must be a top-level BrowserWindow; child widgets, bubbles and other
++// non-window widgets fail closed. A HUMAN-owned window is never a valid target,
++// the release path only touches a lease that matches the requested window, and
++// the timeout timer returns exactly the leased window to the background (never
++// a HUMAN-owned one).
++//
++// Returns true when the assist intent was consumed: a lease was granted and the
++// window presented, a release was handled or denied, or the request was
++// rejected / failed with a structured producer log. Returns false only when the
++// command line carries no assist switch at all (kNotRequested). Every blocked
++// classification is consumed, so an assist invocation can never fall through to
++// ordinary command-line processing and act as a URL / app / incognito launch
++// that could change a HUMAN-owned window or create a visible window.
++bool HandleForegroundAssistRequest(const base::CommandLine& command_line);
++
++// The process-wide controller that owns the single assist timeout timer. The
++// USER_EXPLICIT presentation path calls
++// OnLeaseReleasedByUserTakeover(window_id) so an ASSIST -> HUMAN takeover
++// cancels the pending timeout and the original deadline can never hide a window
++// the user owns (or has handed back).
++ForegroundAssistController* GetForegroundAssistController();
++
++}  // namespace browser_cli
++
++#endif  // CHROME_BROWSER_BROWSER_CLI_FOREGROUND_ASSIST_PRESENTATION_H_
+diff --git a/chrome/browser/browser_cli/foreground_assist_presentation.mm b/chrome/browser/browser_cli/foreground_assist_presentation.mm
+new file mode 100644
+index 0000000000..64a6825a3f
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_presentation.mm
+@@ -0,0 +1,228 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/foreground_assist_presentation.h"
++
++#include "base/logging.h"
++#include "base/no_destructor.h"
++#include "base/notreached.h"
++#include "chrome/browser/browser_cli/foreground_assist.h"
++#include "chrome/browser/browser_cli/foreground_assist_controller.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/global_browser_collection.h"
++#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
++#include "ui/views/widget/widget.h"
++
++namespace browser_cli {
++namespace {
++
++// Structured producer log. `result` is handled / denied / failed / noop and
++// `reason` is the stable machine-readable outcome; the presentation policy and
++// the host add their own BROWSER_CLI_PRESENTATION logs for every actual
++// request, so a producer outcome can always be correlated with a grant / deny
++// / busy / timeout / release decision.
++void LogProducerOutcome(const char* result,
++                        const char* reason,
++                        bool managed_mode,
++                        uint64_t window_id,
++                        const char* lease_reason) {
++  LOG(INFO) << "BROWSER_CLI_FOREGROUND_ASSIST stage=producer"
++            << " result=" << result << " reason=" << reason
++            << " window_id=" << window_id << " lease_reason=" << lease_reason
++            << " managed=" << (managed_mode ? "yes" : "no");
++}
++
++// Routes the controller's effects to the single presentation gateway. Every
++// call re-resolves the host by id, so a destroyed window can never be touched
++// and a new window that reuses the id cannot inherit the lease (the policy
++// releases the lease on destruction).
++class HostForegroundAssistDelegate
++    : public ForegroundAssistController::Delegate {
++ public:
++  bool WindowExists(uint64_t window_id) override {
++    return views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id) !=
++           nullptr;
++  }
++
++  bool WindowIsUserOwned(uint64_t window_id) override {
++    views::NativeWidgetMacNSWindowHost* host =
++        views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
++    return host && host->IsUserExplicitOwned();
++  }
++
++  void ReleaseLeaseForTimeout(uint64_t window_id) override {
++    views::NativeWidgetMacNSWindowHost* host =
++        views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
++    if (host) {
++      host->ReleaseForegroundAssistLease(
++          views::ForegroundAssistReleaseReason::kTimeout);
++    }
++  }
++
++  void ReturnWindowToBackground(uint64_t window_id) override {
++    views::NativeWidgetMacNSWindowHost* host =
++        views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
++    if (host) {
++      host->HideForForegroundAssistRelease();
++    }
++  }
++};
++
++ForegroundAssistController* GetController() {
++  static base::NoDestructor<HostForegroundAssistDelegate> delegate;
++  static base::NoDestructor<ForegroundAssistController> controller(
++      delegate.get(), views::kDefaultForegroundAssistLeaseTtl);
++  return controller.get();
++}
++
++// Whether |host| is a top-level widget that belongs to a real BrowserWindow.
++// The host check rejects child widgets / bubbles / menus; the collection lookup
++// rejects top-level widgets that are not browser windows (for example dialogs).
++bool IsTopLevelBrowserWindow(views::NativeWidgetMacNSWindowHost* host) {
++  if (!host || !host->IsEligibleForegroundAssistTarget()) {
++    return false;
++  }
++  views::Widget* widget = host->GetWidget();
++  GlobalBrowserCollection* collection = GlobalBrowserCollection::GetInstance();
++  return widget && collection &&
++         collection->FindBrowserWithWindow(widget->GetNativeWindow()) !=
++             nullptr;
++}
++
++}  // namespace
++
++ForegroundAssistController* GetForegroundAssistController() {
++  return GetController();
++}
++
++bool HandleForegroundAssistRequest(const base::CommandLine& command_line) {
++  ForegroundAssistRequest request;
++  const ForegroundAssistRequestClass request_class =
++      ClassifyForegroundAssistRequest(command_line, &request);
++  if (!ForegroundAssistRequestClassConsumesCommandLine(request_class)) {
++    // No assist switch: ordinary command-line processing continues.
++    return false;
++  }
++
++  const bool managed_mode = views::NativeWidgetMacNSWindowHost::
++      IsBrowserCliManagedPresentationEnabled();
++  const char* lease_reason =
++      views::ForegroundAssistReasonToString(request.reason);
++
++  switch (request_class) {
++    case ForegroundAssistRequestClass::kBlockedByLaunchArguments:
++      // An assist invocation must never act as an ordinary URL / app /
++      // incognito / automation / headless launch: it is consumed here so the
++      // caller cannot fall through to normal command-line processing that might
++      // change a HUMAN-owned window or create a visible window.
++      LogProducerOutcome("denied", "launch-arguments-not-agent-assist",
++                         managed_mode, request.target_window, lease_reason);
++      return true;
++    case ForegroundAssistRequestClass::kBlockedByUnsupportedTabTarget:
++      // Tab-level targeting is not implemented; reject instead of pretending
++      // the named tab was granted.
++      LogProducerOutcome("denied", "unsupported-tab-target", managed_mode,
++                         request.target_window, lease_reason);
++      return true;
++    case ForegroundAssistRequestClass::kBlockedByConflictingSwitches:
++      LogProducerOutcome("denied", "conflicting-producer-switches",
++                         managed_mode, request.target_window, lease_reason);
++      return true;
++    case ForegroundAssistRequestClass::kBlockedByInvalidReason:
++      LogProducerOutcome("denied", "invalid-reason", managed_mode,
++                         request.target_window, lease_reason);
++      return true;
++    case ForegroundAssistRequestClass::kBlockedByInvalidTarget:
++      LogProducerOutcome("denied", "invalid-target", managed_mode,
++                         request.target_window, lease_reason);
++      return true;
++    case ForegroundAssistRequestClass::kNotRequested:
++      return false;
++    case ForegroundAssistRequestClass::kRequestLease:
++    case ForegroundAssistRequestClass::kReleaseLease:
++      break;
++  }
++
++  if (!managed_mode) {
++    // Stock Chromium has no assist: fail closed, present nothing.
++    LogProducerOutcome("noop", "unmanaged-stock-behavior", managed_mode,
++                       request.target_window, lease_reason);
++    return true;
++  }
++
++  views::NativeWidgetMacNSWindowHost* host =
++      views::NativeWidgetMacNSWindowHost::GetFromWidgetId(
++          request.target_window);
++  if (!host) {
++    LogProducerOutcome("denied", "target-window-not-found", managed_mode,
++                       request.target_window, lease_reason);
++    return true;
++  }
++  // Only a top-level BrowserWindow may be named: child widgets, bubbles, menus
++  // and non-browser top-level windows (for example dialogs) fail closed.
++  if (!IsTopLevelBrowserWindow(host)) {
++    LogProducerOutcome("denied", "target-not-top-level-browser-window",
++                       managed_mode, request.target_window, lease_reason);
++    return true;
++  }
++
++  if (request_class == ForegroundAssistRequestClass::kRequestLease) {
++    // Invariant 5.3: a window the user owns is never a valid assist target.
++    if (host->IsUserExplicitOwned()) {
++      LogProducerOutcome("denied", "target-human-owned", managed_mode,
++                         request.target_window, lease_reason);
++      return true;
++    }
++    switch (host->RequestForegroundAssistLease(request.target_tab,
++                                               request.reason)) {
++      case views::ForegroundAssistRequestResult::kGranted:
++        // Only a granted lease may present the window, through the single
++        // visibility gateway (kAgentAssist is checked by the policy again).
++        if (!host->PresentForAgentAssistAction()) {
++          // A lease must not outlive a failed presentation.
++          host->ReleaseForegroundAssistLease(
++              views::ForegroundAssistReleaseReason::kAgentRelease);
++          LogProducerOutcome("failed", "presentation-denied", managed_mode,
++                             request.target_window, lease_reason);
++          return true;
++        }
++        GetController()->OnLeaseGranted(request.target_window);
++        LogProducerOutcome("handled", "lease-granted-and-presented",
++                           managed_mode, request.target_window, lease_reason);
++        return true;
++      case views::ForegroundAssistRequestResult::kDenied:
++        LogProducerOutcome("denied", "lease-denied", managed_mode,
++                           request.target_window, lease_reason);
++        return true;
++      case views::ForegroundAssistRequestResult::kBusy:
++        LogProducerOutcome("denied", "lease-busy", managed_mode,
++                           request.target_window, lease_reason);
++        return true;
++      case views::ForegroundAssistRequestResult::kInvalidTarget:
++        LogProducerOutcome("denied", "invalid-target", managed_mode,
++                           request.target_window, lease_reason);
++        return true;
++    }
++    NOTREACHED();
++  }
++
++  // Release path: only a lease that matches the requested window is touched.
++  if (!host->IsForegroundAssistLeased()) {
++    LogProducerOutcome("denied", "no-matching-lease", managed_mode,
++                       request.target_window, lease_reason);
++    return true;
++  }
++  host->ReleaseForegroundAssistLease(
++      views::ForegroundAssistReleaseReason::kAgentRelease);
++  GetController()->OnLeaseReleasedByAgent(request.target_window);
++  // Never hide a window the user has taken over.
++  if (!host->IsUserExplicitOwned()) {
++    host->HideForForegroundAssistRelease();
++  }
++  LogProducerOutcome("handled", "lease-released", managed_mode,
++                     request.target_window, lease_reason);
++  return true;
++}
++
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist_unittest.cc b/chrome/browser/browser_cli/foreground_assist_unittest.cc
+new file mode 100644
+index 0000000000..bb77ba6a60
+--- /dev/null
++++ b/chrome/browser/browser_cli/foreground_assist_unittest.cc
+@@ -0,0 +1,313 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/browser_cli/foreground_assist.h"
++
++#include <string>
++
++#include "base/command_line.h"
++#include "chrome/browser/browser_cli/user_explicit_show.h"
++#include "chrome/common/chrome_switches.h"
++#include "content/public/common/content_switches.h"
++#include "testing/gtest/include/gtest/gtest.h"
++#include "ui/gfx/switches.h"
++
++namespace browser_cli {
++namespace {
++
++base::CommandLine RequestCommandLine(const std::string& reason = "login",
++                                     const std::string& window = "42") {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendSwitch(kBrowserCliForegroundAssistSwitch);
++  if (!reason.empty()) {
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistReasonSwitch,
++                                   reason);
++  }
++  if (!window.empty()) {
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistWindowSwitch,
++                                   window);
++  }
++  return command_line;
++}
++
++base::CommandLine ReleaseCommandLine(const std::string& window = "42") {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendSwitch(kBrowserCliForegroundAssistReleaseSwitch);
++  if (!window.empty()) {
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistWindowSwitch,
++                                   window);
++  }
++  return command_line;
++}
++
++TEST(ForegroundAssistRequestTest, NoSwitchIsNotRequested) {
++  const base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kNotRequested);
++}
++
++TEST(ForegroundAssistRequestTest, ValidRequestParsesReasonAndWindow) {
++  base::CommandLine command_line = RequestCommandLine("captcha", "77");
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kRequestLease);
++  EXPECT_EQ(request.target_window, 77u);
++  EXPECT_EQ(request.target_tab, 0u);
++  EXPECT_EQ(request.reason, views::ForegroundAssistReason::kCaptcha);
++}
++
++// Tab-level targeting is not implemented: any tab switch is rejected instead of
++// silently pretending the named tab was granted.
++TEST(ForegroundAssistRequestTest, TabTargetIsRejectedAsUnsupported) {
++  {
++    base::CommandLine command_line = RequestCommandLine("login", "42");
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistTabSwitch, "9");
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByUnsupportedTabTarget);
++  }
++  {
++    base::CommandLine command_line = ReleaseCommandLine("42");
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistTabSwitch, "9");
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByUnsupportedTabTarget);
++  }
++  // A malformed tab value (including zero) stays an invalid target.
++  {
++    base::CommandLine command_line = RequestCommandLine("login", "42");
++    command_line.AppendSwitchASCII(kBrowserCliForegroundAssistTabSwitch, "0");
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByInvalidTarget);
++  }
++}
++
++// Every assist intent (valid or blocked) must be consumed so it can never fall
++// through to ordinary command-line processing and act as a URL / app launch.
++TEST(ForegroundAssistRequestTest, OnlyNotRequestedFallsThrough) {
++  EXPECT_FALSE(ForegroundAssistRequestClassConsumesCommandLine(
++      ForegroundAssistRequestClass::kNotRequested));
++  const ForegroundAssistRequestClass consumed[] = {
++      ForegroundAssistRequestClass::kRequestLease,
++      ForegroundAssistRequestClass::kReleaseLease,
++      ForegroundAssistRequestClass::kBlockedByLaunchArguments,
++      ForegroundAssistRequestClass::kBlockedByInvalidReason,
++      ForegroundAssistRequestClass::kBlockedByInvalidTarget,
++      ForegroundAssistRequestClass::kBlockedByUnsupportedTabTarget,
++      ForegroundAssistRequestClass::kBlockedByConflictingSwitches};
++  for (ForegroundAssistRequestClass request_class : consumed) {
++    EXPECT_TRUE(ForegroundAssistRequestClassConsumesCommandLine(request_class))
++        << "class=" << static_cast<int>(request_class);
++  }
++}
++
++TEST(ForegroundAssistRequestTest, IntentDetectionMatchesProducerSwitches) {
++  EXPECT_FALSE(HasForegroundAssistIntent(
++      base::CommandLine(base::CommandLine::NO_PROGRAM)));
++
++  base::CommandLine release(base::CommandLine::NO_PROGRAM);
++  release.AppendSwitch(kBrowserCliForegroundAssistReleaseSwitch);
++  EXPECT_TRUE(HasForegroundAssistIntent(release));
++
++  // Auxiliary switches alone carry no assist intent.
++  base::CommandLine auxiliary(base::CommandLine::NO_PROGRAM);
++  auxiliary.AppendSwitchASCII(kBrowserCliForegroundAssistWindowSwitch, "42");
++  EXPECT_FALSE(HasForegroundAssistIntent(auxiliary));
++}
++
++// Cold start: without an assist intent the launch command line is
++// byte-identical (nothing changes for ordinary launches or the USER_EXPLICIT
++// show path).
++TEST(ForegroundAssistRequestTest, ColdStartLaunchWithoutIntentIsUnchanged) {
++  base::CommandLine original(base::CommandLine::NO_PROGRAM);
++  original.AppendSwitchASCII("user-data-dir", "/tmp/browser-cli-profile");
++  original.AppendArg("https://example.com/");
++
++  const base::CommandLine launch = CommandLineForColdStartStartup(original);
++  EXPECT_FALSE(launch.HasSwitch(switches::kNoStartupWindow));
++  ASSERT_EQ(launch.GetArgs().size(), 1u);
++  EXPECT_EQ(launch.GetArgs()[0], "https://example.com/");
++  EXPECT_TRUE(launch.HasSwitch("user-data-dir"));
++  // The process command line itself is never modified.
++  EXPECT_FALSE(original.HasSwitch(switches::kNoStartupWindow));
++  EXPECT_EQ(original.GetArgs().size(), 1u);
++}
++
++// Cold start: an assist intent must not reach the ordinary startup as a URL /
++// app / incognito / automation / headless launch. The effective launch command
++// line drops all of those and forces background mode; everything else (profile
++// and Browser CLI flags) survives, and the original request is still classified
++// as blocked so the producer denies and logs it.
++TEST(ForegroundAssistRequestTest, ColdStartLaunchDropsLaunchSideEffects) {
++  base::CommandLine original(base::CommandLine::NO_PROGRAM);
++  original.AppendSwitch(kBrowserCliForegroundAssistSwitch);
++  original.AppendSwitchASCII(kBrowserCliForegroundAssistReasonSwitch, "login");
++  original.AppendSwitchASCII(kBrowserCliForegroundAssistWindowSwitch, "42");
++  original.AppendSwitchASCII("user-data-dir", "/tmp/browser-cli-profile");
++  original.AppendSwitchASCII("profile-directory", "Default");
++  original.AppendSwitch("browser-cli-background-presentation");
++  original.AppendArg("https://example.com/");
++  original.AppendSwitchASCII(switches::kApp, "https://app.example/");
++  original.AppendSwitch(switches::kIncognito);
++  original.AppendSwitch(switches::kEnableAutomation);
++  original.AppendSwitch(switches::kHeadless);
++
++  const base::CommandLine launch = CommandLineForColdStartStartup(original);
++  EXPECT_TRUE(launch.HasSwitch(switches::kNoStartupWindow));
++  EXPECT_TRUE(launch.GetArgs().empty());
++  EXPECT_FALSE(launch.HasSwitch(switches::kApp));
++  EXPECT_FALSE(launch.HasSwitch(switches::kAppId));
++  EXPECT_FALSE(launch.HasSwitch(switches::kIncognito));
++  EXPECT_FALSE(launch.HasSwitch(switches::kEnableAutomation));
++  EXPECT_FALSE(launch.HasSwitch(switches::kHeadless));
++  EXPECT_TRUE(launch.HasSwitch("user-data-dir"));
++  EXPECT_TRUE(launch.HasSwitch("profile-directory"));
++  EXPECT_TRUE(launch.HasSwitch("browser-cli-background-presentation"));
++  EXPECT_TRUE(launch.HasSwitch(kBrowserCliForegroundAssistSwitch));
++
++  // The original still carries the launch arguments and classifies as blocked;
++  // the sanitized startup line is no longer a blocked launch.
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(original, &request),
++            ForegroundAssistRequestClass::kBlockedByLaunchArguments);
++  ASSERT_EQ(original.GetArgs().size(), 1u);
++  EXPECT_EQ(ClassifyForegroundAssistRequest(launch, &request),
++            ForegroundAssistRequestClass::kRequestLease);
++}
++
++TEST(ForegroundAssistRequestTest, EveryReasonValueIsAccepted) {
++  struct Case {
++    const char* value;
++    views::ForegroundAssistReason reason;
++  };
++  const Case cases[] = {
++      {"login", views::ForegroundAssistReason::kLogin},
++      {"captcha", views::ForegroundAssistReason::kCaptcha},
++      {"confirmation", views::ForegroundAssistReason::kConfirmation},
++      {"other", views::ForegroundAssistReason::kOther},
++  };
++  for (const Case& test_case : cases) {
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(
++                  RequestCommandLine(test_case.value), &request),
++              ForegroundAssistRequestClass::kRequestLease)
++        << "reason=" << test_case.value;
++    EXPECT_EQ(request.reason, test_case.reason);
++  }
++}
++
++TEST(ForegroundAssistRequestTest, MissingOrUnknownReasonIsBlocked) {
++  ForegroundAssistRequest request;
++  EXPECT_EQ(
++      ClassifyForegroundAssistRequest(RequestCommandLine("", "42"), &request),
++      ForegroundAssistRequestClass::kBlockedByInvalidReason);
++  EXPECT_EQ(ClassifyForegroundAssistRequest(RequestCommandLine("Login", "42"),
++                                            &request),
++            ForegroundAssistRequestClass::kBlockedByInvalidReason);
++  EXPECT_EQ(ClassifyForegroundAssistRequest(RequestCommandLine("sms", "42"),
++                                            &request),
++            ForegroundAssistRequestClass::kBlockedByInvalidReason);
++}
++
++TEST(ForegroundAssistRequestTest, MissingOrInvalidWindowIsBlocked) {
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(RequestCommandLine("login", ""),
++                                            &request),
++            ForegroundAssistRequestClass::kBlockedByInvalidTarget);
++  const char* invalid_windows[] = {"0",  "-1",  "+7",   " 7",
++                                   "7 ", "abc", "0x10", "18446744073709551616"};
++  for (const char* value : invalid_windows) {
++    EXPECT_EQ(ClassifyForegroundAssistRequest(
++                  RequestCommandLine("login", value), &request),
++              ForegroundAssistRequestClass::kBlockedByInvalidTarget)
++        << "window=" << value;
++  }
++}
++
++TEST(ForegroundAssistRequestTest, LaunchArgumentsAreBlocked) {
++  {
++    base::CommandLine command_line = RequestCommandLine();
++    command_line.AppendArg("https://example.com/");
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByLaunchArguments);
++  }
++  const char* blocking_switches[] = {
++      switches::kApp, switches::kAppId, switches::kIncognito,
++      switches::kEnableAutomation, switches::kHeadless};
++  for (const char* blocking_switch : blocking_switches) {
++    base::CommandLine command_line = RequestCommandLine();
++    command_line.AppendSwitchASCII(blocking_switch, "1");
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByLaunchArguments)
++        << "switch=" << blocking_switch;
++  }
++}
++
++TEST(ForegroundAssistRequestTest, ConflictingProducersAreBlocked) {
++  {
++    base::CommandLine command_line = RequestCommandLine();
++    command_line.AppendSwitch(kBrowserCliForegroundAssistReleaseSwitch);
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByConflictingSwitches);
++  }
++  {
++    base::CommandLine command_line = RequestCommandLine();
++    command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++    ForegroundAssistRequest request;
++    EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++              ForegroundAssistRequestClass::kBlockedByConflictingSwitches);
++  }
++}
++
++TEST(ForegroundAssistRequestTest, ValidReleaseParsesWindow) {
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(ReleaseCommandLine("55"), &request),
++            ForegroundAssistRequestClass::kReleaseLease);
++  EXPECT_EQ(request.target_window, 55u);
++}
++
++TEST(ForegroundAssistRequestTest, ReleaseWithoutOrWithInvalidWindowIsBlocked) {
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(ReleaseCommandLine(""), &request),
++            ForegroundAssistRequestClass::kBlockedByInvalidTarget);
++  EXPECT_EQ(
++      ClassifyForegroundAssistRequest(ReleaseCommandLine("nope"), &request),
++      ForegroundAssistRequestClass::kBlockedByInvalidTarget);
++}
++
++TEST(ForegroundAssistRequestTest, ReleaseWithInvalidReasonIsBlocked) {
++  base::CommandLine command_line = ReleaseCommandLine("55");
++  command_line.AppendSwitchASCII(kBrowserCliForegroundAssistReasonSwitch,
++                                 "sms");
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kBlockedByInvalidReason);
++}
++
++TEST(ForegroundAssistRequestTest, ReleaseLaunchArgumentsAreBlocked) {
++  base::CommandLine command_line = ReleaseCommandLine("55");
++  command_line.AppendArg("https://example.com/");
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kBlockedByLaunchArguments);
++}
++
++TEST(ForegroundAssistRequestTest, SupportingSwitchesKeepRequest) {
++  base::CommandLine command_line = RequestCommandLine();
++  command_line.AppendSwitch("no-startup-window");
++  command_line.AppendSwitch("browser-cli-background-presentation");
++  command_line.AppendSwitchASCII("user-data-dir", "/tmp/browser-cli-profile");
++  command_line.AppendSwitchASCII("profile-directory", "Default");
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kRequestLease);
++}
++
++}  // namespace
++}  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/user_explicit_presentation.mm b/chrome/browser/browser_cli/user_explicit_presentation.mm
+index 8d62708d37..3d569ebede 100644
+--- a/chrome/browser/browser_cli/user_explicit_presentation.mm
++++ b/chrome/browser/browser_cli/user_explicit_presentation.mm
+@@ -10,6 +10,7 @@
+ #include "base/files/file_path.h"
+ #include "base/logging.h"
+ #include "base/notreached.h"
++#include "chrome/browser/browser_cli/foreground_assist_presentation.h"
+ #include "chrome/browser/browser_cli/reopen_window_selection.h"
+ #include "chrome/browser/browser_cli/user_explicit_show.h"
+ #include "chrome/browser/browser_process.h"
+@@ -61,7 +62,17 @@ bool PresentBrowserWindowUserExplicitly(BrowserWindowInterface* browser) {
+   if (!host) {
+     return false;
+   }
+-  return host->PresentForUserExplicitAction();
++  // Browser CLI: ASSIST -> HUMAN. PresentForUserExplicitAction() releases the
++  // assist lease and grants per-window HUMAN ownership inside the policy; only
++  // after that succeeded may the assist timeout tracking be cancelled. A failed
++  // presentation leaves the policy untouched, so the tracking must stay alive
++  // (the controller's own ownership check remains as defense in depth).
++  if (!host->PresentForUserExplicitAction()) {
++    return false;
++  }
++  GetForegroundAssistController()->OnLeaseReleasedByUserTakeover(
++      host->bridged_native_widget_id());
++  return true;
+ }
+ 
+ // Returns the window a user-explicit presentation should pick, or nullptr when
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index 55dd86bb63..d2cf93aab7 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -221,6 +221,8 @@
+ #if BUILDFLAG(IS_MAC)
+ #include <Security/Security.h>
+ 
++#include "chrome/browser/browser_cli/foreground_assist.h"
++#include "chrome/browser/browser_cli/foreground_assist_presentation.h"
+ #include "chrome/browser/browser_cli/user_explicit_presentation.h"
+ #include "chrome/browser/infobars/browser_infobar_manager.h"
+ #include "chrome/browser/infobars/infobar_features.h"
+@@ -566,6 +568,15 @@ void ProcessSingletonNotificationCallbackImpl(
+                                                  current_directory)) {
+     return;
+   }
++
++  // Browser CLI: an agent foreground-assist request or release from a direct
++  // invocation is consumed by the assist producer (validated and fail-closed),
++  // including command lines that also carry launch arguments: an assist
++  // invocation must never act as an ordinary URL / app launch that could change
++  // a HUMAN-owned window or create a visible window.
++  if (browser_cli::HandleForegroundAssistRequest(command_line)) {
++    return;
++  }
+ #endif
+ 
+   StartupProfilePathInfo startup_profile_path_info =
+@@ -1010,8 +1021,6 @@ void ChromeBrowserMainParts::RecordBrowserStartupTime() {
+ // -----------------------------------------------------------------------------
+ // TODO(viettrungluu): move more/rest of BrowserMain() into BrowserMainParts.
+ 
+-
+-
+ // content::BrowserMainParts implementation ------------------------------------
+ 
+ int ChromeBrowserMainParts::PreEarlyInitialization() {
+@@ -2133,9 +2142,24 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+ #endif
+ 
+   // This step is costly.
+-  if (browser_creator_->Start(*base::CommandLine::ForCurrentProcess(),
+-                              base::FilePath(), profile_info,
+-                              last_opened_profiles)) {
++#if BUILDFLAG(IS_MAC)
++  // Browser CLI: a cold start carrying an agent foreground-assist intent must
++  // never be processed by the ordinary startup as a URL / app / incognito /
++  // automation / headless launch. The effective command line drops those launch
++  // arguments (and every positional URL) and adds --no-startup-window, so
++  // StartupBrowserCreator only brings up the process (silent_launch: no URL,
++  // no window, no profile picker); the assist handler below then denies and
++  // logs the original request. Command lines without an assist intent are
++  // passed through unchanged.
++  const base::CommandLine launch_command_line =
++      browser_cli::CommandLineForColdStartStartup(
++          *base::CommandLine::ForCurrentProcess());
++#else
++  const base::CommandLine& launch_command_line =
++      *base::CommandLine::ForCurrentProcess();
++#endif
++  if (browser_creator_->Start(launch_command_line, base::FilePath(),
++                              profile_info, last_opened_profiles)) {
+ #if BUILDFLAG(IS_MAC)
+     // Browser CLI: a cold start carrying the explicit `show` switch presents
+     // exactly one window. The startup path has already created its window (its
+@@ -2144,6 +2168,14 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+     // the resolved profile. Ordinary background starts never reach this call.
+     browser_cli::HandleUserExplicitShowRequest(
+         *base::CommandLine::ForCurrentProcess(), base::FilePath());
++    // Browser CLI: the agent foreground-assist producer shares the same two
++    // entry points as the explicit show producer; it is inert unless the
++    // assist switches are present and valid. The startup above ran with the
++    // sanitized command line, so an assist invocation reaching this point has
++    // no window to target and is denied/logged; on the ProcessSingleton path
++    // the returned consume flag prevents ordinary launch processing.
++    browser_cli::HandleForegroundAssistRequest(
++        *base::CommandLine::ForCurrentProcess());
+ #endif
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
+diff --git a/ui/views/BUILD.gn b/ui/views/BUILD.gn
+index 36c762ee7a..b960dffcdf 100644
+--- a/ui/views/BUILD.gn
++++ b/ui/views/BUILD.gn
+@@ -338,6 +338,7 @@ component("views") {
+     "views_switches.h",
+     "widget/any_widget_observer.h",
+     "widget/any_widget_observer_singleton.h",
++    "widget/browser_cli_foreground_lease.h",
+     "widget/browser_cli_foreground_origin.h",
+     "widget/drop_helper.h",
+     "widget/native_widget.h",
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.h b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+index 63f541554f..905d51186c 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.h
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+@@ -304,6 +304,32 @@ class VIEWS_EXPORT NativeWidgetMacNSWindowHost
+   // stays suppressed. Returns whether the presentation was applied.
+   bool PresentForUserExplicitAction();
+ 
++  // Browser CLI: looks up the managed window host by the policy window id
++  // (widget id) used by the presentation logs and the foreground assist lease.
++  // Returns null when no live host has that id.
++  static NativeWidgetMacNSWindowHost* GetFromWidgetId(uint64_t widget_id);
++
++  // Browser CLI: whether this host is a top-level widget. Child widgets,
++  // bubbles, menus and tooltips fail closed. The assist producer additionally
++  // requires the window to belong to a BrowserWindowInterface, so only a
++  // top-level BrowserWindow can be named as an assist target.
++  bool IsEligibleForegroundAssistTarget();
++
++  // Browser CLI: agent foreground assist (Phase 4 Slice 2). Lease requests,
++  // queries and releases go through the policy singleton inside this component
++  // (origin checked there: only kAgentAssist can ever be granted, a HUMAN-owned
++  // window is always denied and at most one lease exists at a time). The
++  // window may only be presented after a successful grant, and
++  // HideForForegroundAssistRelease() returns exactly this window to the
++  // background; it must never be called for a HUMAN-owned window.
++  ForegroundAssistRequestResult RequestForegroundAssistLease(
++      uint64_t target_tab,
++      ForegroundAssistReason reason);
++  bool IsForegroundAssistLeased();
++  void ReleaseForegroundAssistLease(ForegroundAssistReleaseReason reason);
++  bool PresentForAgentAssistAction();
++  void HideForForegroundAssistRelease();
++
+   // Browser CLI: policy check for a programmatic window-state change that
+   // arrives through ui::BaseWindow (the extension windows API). Activation is
+   // gated by SetVisibilityState(); minimize, restore, maximize, deactivate,
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.mm b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+index 3af7d92464..521208c944 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.mm
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+@@ -337,6 +337,11 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+   BrowserCliPresentationPolicy::Get()->ReleaseUserExplicitOwnership(
+       widget_id_, "window-destroyed");
+ 
++  // Browser CLI: a destroyed window must not keep a foreground assist lease
++  // either; the timeout timer becomes a no-op for this id afterwards.
++  BrowserCliPresentationPolicy::Get()->ReleaseForegroundAssist(
++      widget_id_, ForegroundAssistReleaseReason::kWindowDestroyed);
++
+   native_window_mapping_.reset();
+   if (application_host_) {
+     remote_ns_window_remote_.reset();
+@@ -927,6 +932,77 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+                               ForegroundOrigin::kUserExplicit);
+ }
+ 
++// static
++NativeWidgetMacNSWindowHost* NativeWidgetMacNSWindowHost::GetFromWidgetId(
++    uint64_t widget_id) {
++  auto& hosts = GetIdToWidgetHostImplMap();
++  auto found = hosts.find(widget_id);
++  return found == hosts.end() ? nullptr : found->second;
++}
++
++bool NativeWidgetMacNSWindowHost::IsEligibleForegroundAssistTarget() {
++  const Widget* widget = GetWidget();
++  return widget && widget->is_top_level();
++}
++
++ForegroundAssistRequestResult
++NativeWidgetMacNSWindowHost::RequestForegroundAssistLease(
++    uint64_t target_tab,
++    ForegroundAssistReason reason) {
++  // Defense in depth: a non-top-level widget can never hold an assist lease,
++  // even if a caller bypasses the producer's own eligibility check.
++  if (!IsEligibleForegroundAssistTarget()) {
++    return ForegroundAssistRequestResult::kInvalidTarget;
++  }
++  return BrowserCliPresentationPolicy::Get()->RequestForegroundAssist(
++      ForegroundOrigin::kAgentAssist, widget_id_, target_tab, reason);
++}
++
++bool NativeWidgetMacNSWindowHost::IsForegroundAssistLeased() {
++  return BrowserCliPresentationPolicy::Get()->IsForegroundAssistLeased(
++      widget_id_);
++}
++
++void NativeWidgetMacNSWindowHost::ReleaseForegroundAssistLease(
++    ForegroundAssistReleaseReason reason) {
++  BrowserCliPresentationPolicy::Get()->ReleaseForegroundAssist(widget_id_,
++                                                               reason);
++}
++
++bool NativeWidgetMacNSWindowHost::PresentForAgentAssistAction() {
++  // Only reachable after the policy granted the lease for this window; the
++  // policy checks the lease again (kAgentAssist is an automation origin, so a
++  // HUMAN-owned window stays denied here).
++  const bool applied =
++      ApplyVisibilityState(WindowVisibilityState::kShowAndActivateWindow,
++                           ForegroundOrigin::kAgentAssist);
++  if (applied) {
++    LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=host"
++              << " transition=assist-window-visible"
++              << " widget_id=" << widget_id_
++              << " reason=agent-assist-lease-granted";
++  }
++  return applied;
++}
++
++void NativeWidgetMacNSWindowHost::HideForForegroundAssistRelease() {
++  // Defense in depth: the timeout and release owners already check this, but
++  // the gateway itself must never hide a window the user owns (invariant 5.3).
++  if (IsUserExplicitOwned()) {
++    return;
++  }
++  // Re-arm the per-window AppKit hard stop before hiding, so a later stray
++  // order-in cannot present the window without a new policy grant.
++  if (in_process_ns_window_) {
++    in_process_ns_window_.managedPresentationSuppressed = YES;
++  }
++  ApplyVisibilityState(WindowVisibilityState::kHideWindow,
++                       ForegroundOrigin::kAgentAssist);
++  LOG(INFO) << "BROWSER_CLI_PRESENTATION stage=host"
++            << " transition=assist-window-background"
++            << " widget_id=" << widget_id_ << " reason=assist-lease-released";
++}
++
+ bool NativeWidgetMacNSWindowHost::AllowProgrammaticChangeFromCurrentOrigin(
+     BrowserCliPresentationAction action) {
+   return EvaluatePresentationRequest(action, CurrentForegroundOrigin());
