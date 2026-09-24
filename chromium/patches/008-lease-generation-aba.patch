@@ -1,0 +1,1023 @@
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller.cc b/chrome/browser/browser_cli/foreground_assist_controller.cc
+index 0be9e42a46..0925694036 100644
+--- a/chrome/browser/browser_cli/foreground_assist_controller.cc
++++ b/chrome/browser/browser_cli/foreground_assist_controller.cc
+@@ -19,25 +19,37 @@ ForegroundAssistController::ForegroundAssistController(
+ 
+ ForegroundAssistController::~ForegroundAssistController() = default;
+ 
+-void ForegroundAssistController::OnLeaseGranted(uint64_t window_id) {
++void ForegroundAssistController::OnLeaseGranted(uint64_t window_id,
++                                                uint64_t generation) {
+   DCHECK_NE(window_id, 0u);
++  DCHECK_NE(generation, 0u);
+   if (tracked_window_ == window_id) {
+-    // Idempotent re-request: keep the original deadline, exactly like the
+-    // policy keeps the original lease.
+-    return;
++    if (tracked_generation_ == generation) {
++      // Idempotent re-request: keep the original deadline, exactly like the
++      // policy keeps the original lease.
++      return;
++    }
++    // Same window, new lease generation: the previous lease can only have
++    // ended (lazy expiry, or an explicit release the controller never saw),
++    // and the window is being granted again right now. Only the timer is
++    // replaced; hiding the window here would make the assist presentation
++    // flash.
++  } else {
++    // The single lease slot is free again (otherwise the policy would have
++    // answered kBusy), so the previously tracked window must already be hidden
++    // or was never shown; return it to the background before tracking the new
++    // one so no stale assist window can stay visible.
++    FinalizeTrackedWindow();
+   }
+-  // The single lease slot is free again (otherwise the policy would have
+-  // answered kBusy), so the previously tracked window must already be hidden
+-  // or was never shown; return it to the background before tracking the new
+-  // one so no stale assist window can stay visible.
+-  FinalizeTrackedWindow();
+   tracked_window_ = window_id;
++  tracked_generation_ = generation;
+   lease_timer_.Start(FROM_HERE, lease_ttl_, this,
+                      &ForegroundAssistController::OnLeaseTimeout);
+ }
+ 
+-void ForegroundAssistController::OnLeaseReleasedByAgent(uint64_t window_id) {
+-  CancelTrackingForWindow(window_id);
++void ForegroundAssistController::OnLeaseReleasedByAgent(uint64_t window_id,
++                                                        uint64_t generation) {
++  CancelTrackingForWindow(window_id, generation);
+ }
+ 
+ void ForegroundAssistController::OnLeaseReleasedByUserTakeover(
+@@ -45,25 +57,33 @@ void ForegroundAssistController::OnLeaseReleasedByUserTakeover(
+   // The policy released the lease for this window before granting HUMAN; the
+   // timer must not survive the takeover, otherwise the original deadline could
+   // hide the window after the user hands it back.
+-  CancelTrackingForWindow(window_id);
++  CancelTrackingForWindow(window_id, /*generation=*/0);
+ }
+ 
+-void ForegroundAssistController::CancelTrackingForWindow(uint64_t window_id) {
++void ForegroundAssistController::CancelTrackingForWindow(uint64_t window_id,
++                                                         uint64_t generation) {
+   if (tracked_window_ == 0 || tracked_window_ != window_id) {
+     return;
+   }
++  if (generation != 0 && tracked_generation_ != generation) {
++    // A stale release must never stop the timer of a newer generation.
++    return;
++  }
+   lease_timer_.Stop();
+   tracked_window_ = 0;
++  tracked_generation_ = 0;
+ }
+ 
+ void ForegroundAssistController::OnLeaseTimeout() {
+   const uint64_t window_id = tracked_window_;
++  const uint64_t generation = tracked_generation_;
+   tracked_window_ = 0;
++  tracked_generation_ = 0;
+   if (window_id == 0) {
+     return;
+   }
+-  // The lease was already released (agent release, user takeover, window
+-  // destruction) or the window is gone: the timeout must not touch anything.
++  // The window is gone (destruction already released the lease) or the user
++  // owns it: the timeout must not touch anything.
+   if (!delegate_->WindowExists(window_id)) {
+     return;
+   }
+@@ -71,8 +91,26 @@ void ForegroundAssistController::OnLeaseTimeout() {
+   if (delegate_->WindowIsUserOwned(window_id)) {
+     return;
+   }
+-  delegate_->ReleaseLeaseForTimeout(window_id);
+-  delegate_->ReturnWindowToBackground(window_id);
++  // Segment 1 - timer entry: a timer whose generation was superseded by a
++  // newer lease for the same window must not act at all. Generation 0 means
++  // the tracked lease is already gone (lazy sweep / agent release / takeover);
++  // this timer is then the terminal cleanup and must still return the window
++  // to the background.
++  const uint64_t current_generation =
++      delegate_->CurrentLeaseGeneration(window_id);
++  if (current_generation != 0 && current_generation != generation) {
++    return;
++  }
++  if (current_generation == generation) {
++    // Segment 2 - release: only the exact tracked generation may be released;
++    // if another owner already handled it, do not hide on top of that.
++    if (!delegate_->ReleaseLeaseForTimeout(window_id, generation)) {
++      return;
++    }
++  }
++  // Segment 3 - hide: the host re-verifies that the window is not HUMAN-owned
++  // and that no live (newer) lease covers it before hiding.
++  delegate_->ReturnWindowToBackground(window_id, generation);
+ }
+ 
+ void ForegroundAssistController::FinalizeTrackedWindow() {
+@@ -80,7 +118,9 @@ void ForegroundAssistController::FinalizeTrackedWindow() {
+     return;
+   }
+   const uint64_t previous = tracked_window_;
++  const uint64_t previous_generation = tracked_generation_;
+   tracked_window_ = 0;
++  tracked_generation_ = 0;
+   lease_timer_.Stop();
+   if (!delegate_->WindowExists(previous)) {
+     return;
+@@ -88,11 +128,18 @@ void ForegroundAssistController::FinalizeTrackedWindow() {
+   if (delegate_->WindowIsUserOwned(previous)) {
+     return;
+   }
++  // Never touch the window when a live lease covers it: only a fully released
++  // window may be returned to the background.
++  if (delegate_->CurrentLeaseGeneration(previous) != 0) {
++    return;
++  }
+   // The previous lease is already gone from the policy; this release is a
+   // no-op that only guarantees the timeout log exists for the old window if
+-  // the lazy sweep has not run yet.
+-  delegate_->ReleaseLeaseForTimeout(previous);
+-  delegate_->ReturnWindowToBackground(previous);
++  // the lazy sweep has not run yet. Both effects name the generation that was
++  // tracked, so a newer generation can never be released or hidden through
++  // this path either.
++  delegate_->ReleaseLeaseForTimeout(previous, previous_generation);
++  delegate_->ReturnWindowToBackground(previous, previous_generation);
+ }
+ 
+ }  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller.h b/chrome/browser/browser_cli/foreground_assist_controller.h
+index beae8c9e79..3dc4e9de88 100644
+--- a/chrome/browser/browser_cli/foreground_assist_controller.h
++++ b/chrome/browser/browser_cli/foreground_assist_controller.h
+@@ -24,6 +24,12 @@ namespace browser_cli {
+ // hidden by the timeout path, and a lease that was already released (agent
+ // release, user takeover, window destruction) makes the timer a no-op.
+ //
++// Lease generations (P0 ABA fix): the policy mints a new request_seq for every
++// new lease. The controller tracks (window_id, generation) and every effect it
++// triggers re-verifies the generation, so a timer (or release command) that
++// belongs to a lease which has already ended can never release or hide the
++// lease that replaced it for the same window.
++//
+ // UI-thread only, like the policy.
+ class ForegroundAssistController {
+  public:
+@@ -37,12 +43,21 @@ class ForegroundAssistController {
+     virtual bool WindowExists(uint64_t window_id) = 0;
+     // Whether the user owns (HUMAN) the window. Never hide such a window.
+     virtual bool WindowIsUserOwned(uint64_t window_id) = 0;
+-    // Policy release with reason=timeout. No-op when the lease is already gone
+-    // (lazy sweep, agent release, takeover, destruction).
+-    virtual void ReleaseLeaseForTimeout(uint64_t window_id) = 0;
+-    // Return exactly this window to the background (hide). Never called for a
+-    // HUMAN-owned or destroyed window.
+-    virtual void ReturnWindowToBackground(uint64_t window_id) = 0;
++    // Live policy generation (request_seq) for |window_id|, or 0 when no live
++    // lease covers it. The controller compares it with the generation it
++    // tracks to detect a superseded (ABA) lease.
++    virtual uint64_t CurrentLeaseGeneration(uint64_t window_id) = 0;
++    // Policy release with reason=timeout for exactly |generation|. Returns true
++    // only when that generation was live and has been released; a newer
++    // generation is never touched. No-op when the lease is already gone (lazy
++    // sweep, agent release, takeover, destruction).
++    virtual bool ReleaseLeaseForTimeout(uint64_t window_id,
++                                        uint64_t generation) = 0;
++    // Return exactly this window to the background (hide). The implementation
++    // must re-verify that the window is not HUMAN-owned and that no live
++    // (newer) lease covers it. Never hides a HUMAN-owned or destroyed window.
++    virtual void ReturnWindowToBackground(uint64_t window_id,
++                                          uint64_t generation) = 0;
+   };
+ 
+   ForegroundAssistController(Delegate* delegate, base::TimeDelta lease_ttl);
+@@ -51,18 +66,24 @@ class ForegroundAssistController {
+       delete;
+   ~ForegroundAssistController();
+ 
+-  // Called after the policy granted a lease for |window_id|. Starts the TTL
+-  // timer. An idempotent re-request for the window that is already tracked
+-  // keeps the original deadline (the policy does not extend it either). A
+-  // grant for a different window first returns the previously tracked window
+-  // to the background: the single lease slot was already free, so the previous
+-  // window must not stay visible behind the new one.
+-  void OnLeaseGranted(uint64_t window_id);
++  // Called after the policy granted a lease for |window_id| with |generation|
++  // (the lease request_seq). Starts the TTL timer. An idempotent re-request for
++  // the window and generation that are already tracked keeps the original
++  // deadline (the policy does not extend it either). A grant for the same
++  // window with a new generation only replaces the timer: the old lease ended
++  // and the window is being presented again, so hiding here would make a
++  // visible assist window flash. A grant for a different window first returns
++  // the previously tracked window to the background: the single lease slot was
++  // already free, so the previous window must not stay visible behind the new
++  // one.
++  void OnLeaseGranted(uint64_t window_id, uint64_t generation);
+ 
+   // Agent-initiated release: the caller performs the policy release and hide;
+   // this only stops the timer so the timeout cannot fire for a lease that is
+-  // already gone. Only cancels tracking when |window_id| is the tracked window.
+-  void OnLeaseReleasedByAgent(uint64_t window_id);
++  // already gone. Only cancels tracking when |window_id| and, when nonzero,
++  // |generation| match the tracked lease: a stale release must never stop the
++  // timer of a newer generation.
++  void OnLeaseReleasedByAgent(uint64_t window_id, uint64_t generation = 0);
+ 
+   // USER_EXPLICIT takeover (ASSIST -> HUMAN): the policy has already released
+   // the lease for |window_id|. Cancel the tracking and the pending timeout
+@@ -74,16 +95,20 @@ class ForegroundAssistController {
+ 
+   bool IsTrackingWindowForTesting() const { return tracked_window_ != 0; }
+   uint64_t tracked_window_for_testing() const { return tracked_window_; }
++  uint64_t tracked_generation_for_testing() const {
++    return tracked_generation_;
++  }
+ 
+  private:
+   void OnLeaseTimeout();
+   void FinalizeTrackedWindow();
+-  void CancelTrackingForWindow(uint64_t window_id);
++  void CancelTrackingForWindow(uint64_t window_id, uint64_t generation);
+ 
+   raw_ptr<Delegate> delegate_;
+   const base::TimeDelta lease_ttl_;
+   base::OneShotTimer lease_timer_;
+   uint64_t tracked_window_ = 0;
++  uint64_t tracked_generation_ = 0;
+ };
+ 
+ }  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc b/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc
+index abb2a9f52d..d98af01873 100644
+--- a/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc
++++ b/chrome/browser/browser_cli/foreground_assist_controller_unittest.cc
+@@ -4,7 +4,9 @@
+ 
+ #include "chrome/browser/browser_cli/foreground_assist_controller.h"
+ 
++#include <map>
+ #include <set>
++#include <utility>
+ #include <vector>
+ 
+ #include "base/test/task_environment.h"
+@@ -16,6 +18,14 @@ namespace {
+ 
+ constexpr base::TimeDelta kTestTtl = base::Seconds(30);
+ 
++using LeaseRef = std::pair<uint64_t, uint64_t>;  // (window_id, generation)
++
++// Mirrors the production Delegate contracts:
++//  * CurrentLeaseGeneration() reports the live policy generation (0 = none);
++//  * ReleaseLeaseForTimeout() releases exactly the named generation and
++//    refuses every other one (that is the policy-side ABA guard);
++//  * ReturnWindowToBackground() refuses to hide when the window is user-owned
++//    or still covered by a live (possibly newer) lease (host-side guard).
+ class FakeDelegate : public ForegroundAssistController::Delegate {
+  public:
+   bool WindowExists(uint64_t window_id) override {
+@@ -24,21 +34,53 @@ class FakeDelegate : public ForegroundAssistController::Delegate {
+   bool WindowIsUserOwned(uint64_t window_id) override {
+     return user_owned.count(window_id) > 0;
+   }
+-  void ReleaseLeaseForTimeout(uint64_t window_id) override {
+-    released.push_back(window_id);
++  uint64_t CurrentLeaseGeneration(uint64_t window_id) override {
++    auto found = current_generation.find(window_id);
++    return found == current_generation.end() ? 0 : found->second;
++  }
++  bool ReleaseLeaseForTimeout(uint64_t window_id,
++                              uint64_t generation) override {
++    if (!WindowExists(window_id) ||
++        CurrentLeaseGeneration(window_id) != generation) {
++      return false;
++    }
++    current_generation.erase(window_id);
++    released.push_back({window_id, generation});
++    return true;
+   }
+-  void ReturnWindowToBackground(uint64_t window_id) override {
+-    returned_to_background.push_back(window_id);
++  void ReturnWindowToBackground(uint64_t window_id,
++                                uint64_t generation) override {
++    if (WindowIsUserOwned(window_id) ||
++        CurrentLeaseGeneration(window_id) != 0) {
++      refused.push_back({window_id, generation});
++      return;
++    }
++    returned_to_background.push_back({window_id, generation});
+   }
+ 
+   std::set<uint64_t> existing;
+   std::set<uint64_t> user_owned;
+-  std::vector<uint64_t> released;
+-  std::vector<uint64_t> returned_to_background;
++  std::map<uint64_t, uint64_t> current_generation;
++  std::vector<LeaseRef> released;
++  std::vector<LeaseRef> refused;
++  std::vector<LeaseRef> returned_to_background;
+ };
+ 
+ class ForegroundAssistControllerTest : public testing::Test {
+  protected:
++  // Mirrors a policy grant: the window exists and the named generation is the
++  // live lease.
++  void PolicyGrant(uint64_t window_id, uint64_t generation) {
++    delegate_.existing.insert(window_id);
++    delegate_.current_generation[window_id] = generation;
++  }
++
++  // Mirrors the policy lazily releasing an expired lease without the
++  // controller noticing.
++  void PolicyLazyExpire(uint64_t window_id) {
++    delegate_.current_generation.erase(window_id);
++  }
++
+   base::test::TaskEnvironment task_environment_{
+       base::test::TaskEnvironment::TimeSource::MOCK_TIME};
+   FakeDelegate delegate_;
+@@ -47,8 +89,8 @@ class ForegroundAssistControllerTest : public testing::Test {
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        TimeoutReturnsOnlyTheTrackedWindowToBackground) {
+-  delegate_.existing = {7, 8};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+   EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
+ 
+   task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
+@@ -56,8 +98,8 @@ TEST_F(ForegroundAssistControllerTest,
+   EXPECT_TRUE(delegate_.returned_to_background.empty());
+ 
+   task_environment_.FastForwardBy(base::Milliseconds(1));
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 1}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
+   EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
+ 
+   // The timeout fires exactly once.
+@@ -67,9 +109,9 @@ TEST_F(ForegroundAssistControllerTest,
+ }
+ 
+ TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForAWindowTheUserOwns) {
+-  delegate_.existing = {7};
+-  delegate_.user_owned = {7};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  delegate_.user_owned.insert(7);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+ 
+   task_environment_.FastForwardBy(kTestTtl);
+   EXPECT_TRUE(delegate_.released.empty());
+@@ -79,7 +121,7 @@ TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForAWindowTheUserOwns) {
+ 
+ TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForADestroyedWindow) {
+   // No window exists: destruction already released the lease and hid nothing.
+-  controller_.OnLeaseGranted(7);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+ 
+   task_environment_.FastForwardBy(kTestTtl);
+   EXPECT_TRUE(delegate_.released.empty());
+@@ -89,27 +131,33 @@ TEST_F(ForegroundAssistControllerTest, TimeoutIsNoopForADestroyedWindow) {
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        NewGrantFinalizesThePreviouslyTrackedWindow) {
+-  delegate_.existing = {7, 8};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+   task_environment_.FastForwardBy(base::Milliseconds(5));
+ 
+   // The single lease slot was already free for window 8, so window 7 must be
+-  // returned to the background before window 8 is tracked.
+-  controller_.OnLeaseGranted(8);
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  // returned to the background before window 8 is tracked. The policy already
++  // released generation 1 with the grant for window 8, so the release itself
++  // is a no-op and only the hide remains.
++  PolicyLazyExpire(7);
++  PolicyGrant(8, /*generation=*/2);
++  controller_.OnLeaseGranted(8, /*generation=*/2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
+   EXPECT_EQ(controller_.tracked_window_for_testing(), 8u);
++  EXPECT_EQ(controller_.tracked_generation_for_testing(), 2u);
+ 
+   task_environment_.FastForwardBy(kTestTtl);
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7, 8}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7, 8}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{8, 2}}));
++  EXPECT_EQ(delegate_.returned_to_background,
++            std::vector<LeaseRef>({{7, 1}, {8, 2}}));
+ }
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        AgentReleaseStopsTheTimerWithoutTouchingTheWindow) {
+-  delegate_.existing = {7};
+-  controller_.OnLeaseGranted(7);
+-  controller_.OnLeaseReleasedByAgent(7);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++  controller_.OnLeaseReleasedByAgent(7, /*generation=*/1);
+   EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
+ 
+   // The agent release path performs the policy release and hide itself; the
+@@ -121,22 +169,127 @@ TEST_F(ForegroundAssistControllerTest,
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        AgentReleaseForAnotherWindowKeepsTracking) {
+-  delegate_.existing = {7, 8};
+-  controller_.OnLeaseGranted(7);
+-  controller_.OnLeaseReleasedByAgent(8);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++  controller_.OnLeaseReleasedByAgent(8, /*generation=*/5);
++
++  EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 1}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
++}
++
++// A release command that names an older generation must never stop the timer
++// of the generation that is tracked now (ABA on the release path).
++TEST_F(ForegroundAssistControllerTest,
++       AgentReleaseForAStaleGenerationKeepsTheNewLeaseTimer) {
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++
++  task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
++  // Same window, new lease: a fresh grant replaces the timer.
++  PolicyGrant(7, /*generation=*/2);
++  controller_.OnLeaseGranted(7, /*generation=*/2);
++  controller_.OnLeaseReleasedByAgent(7, /*generation=*/1);
+ 
+   EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
++  EXPECT_EQ(controller_.tracked_generation_for_testing(), 2u);
++
++  // The original deadline passes: the stale timer must be gone.
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++
++  task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 2}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 2}}));
++}
++
++// P0 ABA regression: generation 1 lazily expires (policy releases it without
++// notifying the controller) and generation 2 is granted for the same window,
++// but the controller has not seen the new grant yet. The stale timer for
++// generation 1 must not release or hide generation 2.
++TEST_F(ForegroundAssistControllerTest,
++       StaleTimerCannotReleaseOrHideTheNewLease) {
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  PolicyLazyExpire(7);
++  delegate_.current_generation[7] = 2;  // New grant, not yet reported.
++
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.refused.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++  EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
++  EXPECT_EQ(delegate_.CurrentLeaseGeneration(7), 2u);
++
++  // Reporting the new grant starts a fresh timer for generation 2 only.
++  controller_.OnLeaseGranted(7, /*generation=*/2);
++  task_environment_.FastForwardBy(kTestTtl);
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 2}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 2}}));
++}
++
++// Same-window regrant while the controller was tracking: replacing the timer
++// must not hide the window (it is being presented for the new lease), and the
++// old deadline must not fire.
++TEST_F(ForegroundAssistControllerTest,
++       RegrantForTheSameWindowReplacesTheTimerWithoutHiding) {
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++
++  task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
++  PolicyGrant(7, /*generation=*/2);
++  controller_.OnLeaseGranted(7, /*generation=*/2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++
++  task_environment_.FastForwardBy(base::Milliseconds(1));
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_TRUE(delegate_.returned_to_background.empty());
++
++  task_environment_.FastForwardBy(kTestTtl - base::Milliseconds(1));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 2}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 2}}));
++}
++
++// A live generation for another window must never be touched by the timer of
++// the tracked window, and the new window is only tracked when its grant is
++// reported.
++TEST_F(ForegroundAssistControllerTest,
++       StaleTimerForAnotherWindowNeverTouchesTheNewLease) {
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  PolicyLazyExpire(7);
++  PolicyGrant(8, /*generation=*/2);  // New lease, not yet reported.
++
++  // The tracked lease of window 7 had already expired lazily (its policy
++  // release happened in the sweep), so this timer only performs the hide and
++  // never touches the live generation of window 8.
++  task_environment_.FastForwardBy(kTestTtl / 2);
++  EXPECT_TRUE(delegate_.released.empty());
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
++  EXPECT_EQ(delegate_.CurrentLeaseGeneration(8), 2u);
++
++  controller_.OnLeaseGranted(8, /*generation=*/2);
+   task_environment_.FastForwardBy(kTestTtl);
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{8, 2}}));
++  EXPECT_EQ(delegate_.returned_to_background,
++            std::vector<LeaseRef>({{7, 1}, {8, 2}}));
+ }
+ 
+ // ASSIST -> HUMAN: the takeover cancels the pending timeout explicitly. Without
+ // this, a user who hands the window back before the original deadline would
+ // have the stale timer hide the window.
+ TEST_F(ForegroundAssistControllerTest, UserTakeoverCancelsThePendingTimeout) {
+-  delegate_.existing = {7};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  delegate_.user_owned.insert(7);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
++  PolicyLazyExpire(7);
+   controller_.OnLeaseReleasedByUserTakeover(7);
+   EXPECT_FALSE(controller_.IsTrackingWindowForTesting());
+ 
+@@ -150,36 +303,37 @@ TEST_F(ForegroundAssistControllerTest, UserTakeoverCancelsThePendingTimeout) {
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        UserTakeoverForAnotherWindowKeepsTracking) {
+-  delegate_.existing = {7, 8};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+   controller_.OnLeaseReleasedByUserTakeover(8);
+   EXPECT_TRUE(controller_.IsTrackingWindowForTesting());
+ 
+   task_environment_.FastForwardBy(kTestTtl);
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 1}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
+ }
+ 
+ TEST_F(ForegroundAssistControllerTest,
+        IdempotentGrantKeepsTheOriginalDeadline) {
+-  delegate_.existing = {7};
+-  controller_.OnLeaseGranted(7);
++  PolicyGrant(7, /*generation=*/1);
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+   task_environment_.FastForwardBy(kTestTtl / 2);
+-  controller_.OnLeaseGranted(7);
++  // Same window, same generation: the policy keeps the original deadline, and
++  // so must the timer.
++  controller_.OnLeaseGranted(7, /*generation=*/1);
+ 
+-  // Half a TTL is left; a restarted timer would still be pending here.
+   task_environment_.FastForwardBy(kTestTtl / 2);
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({7}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({7}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{7, 1}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{7, 1}}));
+ }
+ 
+ TEST_F(ForegroundAssistControllerTest, TimeoutNeverTouchesOtherWindows) {
+-  delegate_.existing = {7, 8, 9};
+-  controller_.OnLeaseGranted(8);
++  PolicyGrant(8, /*generation=*/1);
++  controller_.OnLeaseGranted(8, /*generation=*/1);
+   task_environment_.FastForwardBy(kTestTtl);
+ 
+-  EXPECT_EQ(delegate_.released, std::vector<uint64_t>({8}));
+-  EXPECT_EQ(delegate_.returned_to_background, std::vector<uint64_t>({8}));
++  EXPECT_EQ(delegate_.released, std::vector<LeaseRef>({{8, 1}}));
++  EXPECT_EQ(delegate_.returned_to_background, std::vector<LeaseRef>({{8, 1}}));
+ }
+ 
+ }  // namespace
+diff --git a/chrome/browser/browser_cli/foreground_assist_presentation.mm b/chrome/browser/browser_cli/foreground_assist_presentation.mm
+index 64a6825a3f..357e273252 100644
+--- a/chrome/browser/browser_cli/foreground_assist_presentation.mm
++++ b/chrome/browser/browser_cli/foreground_assist_presentation.mm
+@@ -36,7 +36,9 @@ void LogProducerOutcome(const char* result,
+ // Routes the controller's effects to the single presentation gateway. Every
+ // call re-resolves the host by id, so a destroyed window can never be touched
+ // and a new window that reuses the id cannot inherit the lease (the policy
+-// releases the lease on destruction).
++// releases the lease on destruction). Generation-aware: each call names the
++// lease generation it acts on, and the policy/host re-verify it, so a stale
++// timer or release can never kill a newer lease of the same window.
+ class HostForegroundAssistDelegate
+     : public ForegroundAssistController::Delegate {
+  public:
+@@ -51,20 +53,29 @@ bool WindowIsUserOwned(uint64_t window_id) override {
+     return host && host->IsUserExplicitOwned();
+   }
+ 
+-  void ReleaseLeaseForTimeout(uint64_t window_id) override {
++  uint64_t CurrentLeaseGeneration(uint64_t window_id) override {
+     views::NativeWidgetMacNSWindowHost* host =
+         views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
+-    if (host) {
+-      host->ReleaseForegroundAssistLease(
+-          views::ForegroundAssistReleaseReason::kTimeout);
++    return host ? host->GetForegroundAssistLeaseGeneration() : 0;
++  }
++
++  bool ReleaseLeaseForTimeout(uint64_t window_id,
++                              uint64_t generation) override {
++    views::NativeWidgetMacNSWindowHost* host =
++        views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
++    if (!host) {
++      return false;
+     }
++    return host->ReleaseForegroundAssistLease(
++        views::ForegroundAssistReleaseReason::kTimeout, generation);
+   }
+ 
+-  void ReturnWindowToBackground(uint64_t window_id) override {
++  void ReturnWindowToBackground(uint64_t window_id,
++                                uint64_t generation) override {
+     views::NativeWidgetMacNSWindowHost* host =
+         views::NativeWidgetMacNSWindowHost::GetFromWidgetId(window_id);
+     if (host) {
+-      host->HideForForegroundAssistRelease();
++      host->HideForForegroundAssistRelease(generation);
+     }
+   }
+ };
+@@ -176,21 +187,30 @@ bool HandleForegroundAssistRequest(const base::CommandLine& command_line) {
+     }
+     switch (host->RequestForegroundAssistLease(request.target_tab,
+                                                request.reason)) {
+-      case views::ForegroundAssistRequestResult::kGranted:
++      case views::ForegroundAssistRequestResult::kGranted: {
+         // Only a granted lease may present the window, through the single
+         // visibility gateway (kAgentAssist is checked by the policy again).
+         if (!host->PresentForAgentAssistAction()) {
+-          // A lease must not outlive a failed presentation.
++          // A lease must not outlive a failed presentation: release exactly the
++          // generation that was just granted.
+           host->ReleaseForegroundAssistLease(
+-              views::ForegroundAssistReleaseReason::kAgentRelease);
++              views::ForegroundAssistReleaseReason::kAgentRelease,
++              host->GetForegroundAssistLeaseGeneration());
+           LogProducerOutcome("failed", "presentation-denied", managed_mode,
+                              request.target_window, lease_reason);
+           return true;
+         }
+-        GetController()->OnLeaseGranted(request.target_window);
++        // Hand the controller the generation the policy actually minted, so its
++        // timer tracks the lease and not just the window id. A re-request for
++        // the same live lease reports the unchanged generation, which keeps the
++        // original deadline; a regrant reports the new one, which replaces the
++        // timer (P0 ABA fix).
++        GetController()->OnLeaseGranted(
++            request.target_window, host->GetForegroundAssistLeaseGeneration());
+         LogProducerOutcome("handled", "lease-granted-and-presented",
+                            managed_mode, request.target_window, lease_reason);
+         return true;
++      }
+       case views::ForegroundAssistRequestResult::kDenied:
+         LogProducerOutcome("denied", "lease-denied", managed_mode,
+                            request.target_window, lease_reason);
+@@ -207,18 +227,22 @@ bool HandleForegroundAssistRequest(const base::CommandLine& command_line) {
+     NOTREACHED();
+   }
+ 
+-  // Release path: only a lease that matches the requested window is touched.
+-  if (!host->IsForegroundAssistLeased()) {
++  // Release path: only the requested window's current lease is touched.
++  // Capture its generation first so every step below (policy release, tracking
++  // cancel, hide) names exactly that generation and a newer one can never be
++  // killed by a stale release request.
++  const uint64_t generation = host->GetForegroundAssistLeaseGeneration();
++  if (generation == 0) {
+     LogProducerOutcome("denied", "no-matching-lease", managed_mode,
+                        request.target_window, lease_reason);
+     return true;
+   }
+   host->ReleaseForegroundAssistLease(
+-      views::ForegroundAssistReleaseReason::kAgentRelease);
+-  GetController()->OnLeaseReleasedByAgent(request.target_window);
++      views::ForegroundAssistReleaseReason::kAgentRelease, generation);
++  GetController()->OnLeaseReleasedByAgent(request.target_window, generation);
+   // Never hide a window the user has taken over.
+   if (!host->IsUserExplicitOwned()) {
+-    host->HideForForegroundAssistRelease();
++    host->HideForForegroundAssistRelease(generation);
+   }
+   LogProducerOutcome("handled", "lease-released", managed_mode,
+                      request.target_window, lease_reason);
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.h b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+index 905d51186c..d7d5770033 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.h
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.h
+@@ -326,9 +326,22 @@ class VIEWS_EXPORT NativeWidgetMacNSWindowHost
+       uint64_t target_tab,
+       ForegroundAssistReason reason);
+   bool IsForegroundAssistLeased();
+-  void ReleaseForegroundAssistLease(ForegroundAssistReleaseReason reason);
++  // request_seq of the live lease covering this window, or 0 when no live
++  // lease covers it (read-only query; just-expired leases are swept first).
++  // The timeout/release owners use it as the ABA generation guard: a stale
++  // owner must verify the generation before it acts.
++  uint64_t GetForegroundAssistLeaseGeneration() const;
++  // Releases the lease covering this window. With a nonzero
++  // |expected_generation| only a lease whose request_seq matches is released;
++  // returns whether a lease was actually released.
++  bool ReleaseForegroundAssistLease(ForegroundAssistReleaseReason reason,
++                                    uint64_t expected_generation = 0);
+   bool PresentForAgentAssistAction();
+-  void HideForForegroundAssistRelease();
++  // Returns this window to the background. With a nonzero |generation| the hide
++  // is refused while a live lease still covers the window, so a stale timeout
++  // or release can never hide a newer generation; a HUMAN-owned window is never
++  // hidden either.
++  void HideForForegroundAssistRelease(uint64_t generation = 0);
+ 
+   // Browser CLI: policy check for a programmatic window-state change that
+   // arrives through ui::BaseWindow (the extension windows API). Activation is
+diff --git a/ui/views/cocoa/native_widget_mac_ns_window_host.mm b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+index 521208c944..0b6fcca666 100644
+--- a/ui/views/cocoa/native_widget_mac_ns_window_host.mm
++++ b/ui/views/cocoa/native_widget_mac_ns_window_host.mm
+@@ -963,10 +963,17 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+       widget_id_);
+ }
+ 
+-void NativeWidgetMacNSWindowHost::ReleaseForegroundAssistLease(
+-    ForegroundAssistReleaseReason reason) {
+-  BrowserCliPresentationPolicy::Get()->ReleaseForegroundAssist(widget_id_,
+-                                                               reason);
++uint64_t NativeWidgetMacNSWindowHost::GetForegroundAssistLeaseGeneration()
++    const {
++  return BrowserCliPresentationPolicy::Get()
++      ->GetForegroundAssistLeaseGeneration(widget_id_);
++}
++
++bool NativeWidgetMacNSWindowHost::ReleaseForegroundAssistLease(
++    ForegroundAssistReleaseReason reason,
++    uint64_t expected_generation) {
++  return BrowserCliPresentationPolicy::Get()->ReleaseForegroundAssist(
++      widget_id_, reason, expected_generation);
+ }
+ 
+ bool NativeWidgetMacNSWindowHost::PresentForAgentAssistAction() {
+@@ -985,12 +992,20 @@ void HandleAccelerator(const ui::Accelerator& accelerator,
+   return applied;
+ }
+ 
+-void NativeWidgetMacNSWindowHost::HideForForegroundAssistRelease() {
++void NativeWidgetMacNSWindowHost::HideForForegroundAssistRelease(
++    uint64_t generation) {
+   // Defense in depth: the timeout and release owners already check this, but
+   // the gateway itself must never hide a window the user owns (invariant 5.3).
+   if (IsUserExplicitOwned()) {
+     return;
+   }
++  // ABA guard: when the caller names the generation it released, refuse to hide
++  // while any live lease (necessarily a newer generation, the named one is
++  // already gone) covers the window again. Generation 0 is used by callers
++  // that already know no lease is live.
++  if (generation != 0 && GetForegroundAssistLeaseGeneration() != 0) {
++    return;
++  }
+   // Re-arm the per-window AppKit hard stop before hiding, so a later stray
+   // order-in cannot present the window without a new policy grant.
+   if (in_process_ns_window_) {
+diff --git a/ui/views/widget/browser_cli_presentation_policy.cc b/ui/views/widget/browser_cli_presentation_policy.cc
+index cb3dadadc1..77c8aabe7c 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.cc
++++ b/ui/views/widget/browser_cli_presentation_policy.cc
+@@ -191,7 +191,8 @@ bool BrowserCliPresentationPolicy::AllowPresentation(
+     reason = "user-explicit-always-allowed";
+     if (leased) {
+       ReleaseForegroundAssistLocked(
+-          window_id, ForegroundAssistReleaseReason::kUserTakeover);
++          window_id, ForegroundAssistReleaseReason::kUserTakeover,
++          /*expected_generation=*/0);
+     }
+     if (window_id != 0) {
+       newly_owned = user_explicit_owned_window_ids_.insert(window_id).second;
+@@ -361,15 +362,16 @@ BrowserCliPresentationPolicy::RequestForegroundAssist(
+   return decision.result;
+ }
+ 
+-void BrowserCliPresentationPolicy::ReleaseForegroundAssist(
++bool BrowserCliPresentationPolicy::ReleaseForegroundAssist(
+     uint64_t window_id,
+-    ForegroundAssistReleaseReason reason) {
++    ForegroundAssistReleaseReason reason,
++    uint64_t expected_generation) {
+   EnsureInitializedFromCommandLine();
+   if (!managed_mode_enabled_) {
+-    return;
++    return false;
+   }
+   ReleaseExpiredForegroundAssistLeasesLocked();
+-  ReleaseForegroundAssistLocked(window_id, reason);
++  return ReleaseForegroundAssistLocked(window_id, reason, expected_generation);
+ }
+ 
+ size_t BrowserCliPresentationPolicy::ReleaseExpiredForegroundAssistLeases() {
+@@ -391,6 +393,20 @@ bool BrowserCliPresentationPolicy::IsForegroundAssistLeased(
+          active_foreground_assist_lease_->window_id == window_id;
+ }
+ 
++uint64_t BrowserCliPresentationPolicy::GetForegroundAssistLeaseGeneration(
++    uint64_t window_id) {
++  EnsureInitializedFromCommandLine();
++  if (!managed_mode_enabled_) {
++    return 0;
++  }
++  ReleaseExpiredForegroundAssistLeasesLocked();
++  if (!active_foreground_assist_lease_ ||
++      active_foreground_assist_lease_->window_id != window_id) {
++    return 0;
++  }
++  return active_foreground_assist_lease_->request_seq;
++}
++
+ BrowserCliPresentationState
+ BrowserCliPresentationPolicy::window_state_for_testing(uint64_t window_id) {
+   if (state_ != BrowserCliPresentationState::kBackground) {
+@@ -405,12 +421,20 @@ BrowserCliPresentationPolicy::window_state_for_testing(uint64_t window_id) {
+   return BrowserCliPresentationState::kBackground;
+ }
+ 
+-void BrowserCliPresentationPolicy::ReleaseForegroundAssistLocked(
++bool BrowserCliPresentationPolicy::ReleaseForegroundAssistLocked(
+     uint64_t window_id,
+-    ForegroundAssistReleaseReason reason) {
++    ForegroundAssistReleaseReason reason,
++    uint64_t expected_generation) {
+   if (!active_foreground_assist_lease_ ||
+       active_foreground_assist_lease_->window_id != window_id) {
+-    return;
++    return false;
++  }
++  // ABA guard: a stale owner that names an older generation must never release
++  // the generation that replaced it. Generation 0 means "the current lease for
++  // this window" (used by takeover and window destruction).
++  if (expected_generation != 0 &&
++      active_foreground_assist_lease_->request_seq != expected_generation) {
++    return false;
+   }
+   const ForegroundLease lease = *active_foreground_assist_lease_;
+   active_foreground_assist_lease_.reset();
+@@ -421,6 +445,7 @@ void BrowserCliPresentationPolicy::ReleaseForegroundAssistLocked(
+             << " lease_reason=" << ForegroundAssistReasonToString(lease.reason)
+             << " request_seq=" << lease.request_seq
+             << " reason=" << ForegroundAssistReleaseReasonToString(reason);
++  return true;
+ }
+ 
+ size_t
+@@ -431,7 +456,8 @@ BrowserCliPresentationPolicy::ReleaseExpiredForegroundAssistLeasesLocked() {
+   }
+   const uint64_t window_id = active_foreground_assist_lease_->window_id;
+   ReleaseForegroundAssistLocked(window_id,
+-                                ForegroundAssistReleaseReason::kTimeout);
++                                ForegroundAssistReleaseReason::kTimeout,
++                                /*expected_generation=*/0);
+   return 1;
+ }
+ 
+diff --git a/ui/views/widget/browser_cli_presentation_policy.h b/ui/views/widget/browser_cli_presentation_policy.h
+index 485f34eec5..2e0d23722e 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.h
++++ b/ui/views/widget/browser_cli_presentation_policy.h
+@@ -246,8 +246,14 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // destruction). No-op when the id holds no lease, in unmanaged mode, or
+   // after a user takeover (the takeover already released the lease and the
+   // window is HUMAN-owned). Never shows or hides anything.
+-  void ReleaseForegroundAssist(uint64_t window_id,
+-                               ForegroundAssistReleaseReason reason);
++  //
++  // `expected_generation` is the ABA guard used by release and timeout owners:
++  // when nonzero, only a lease whose request_seq matches is released, so a
++  // stale owner can never kill a newer generation of the same window. Returns
++  // whether a lease was actually released.
++  bool ReleaseForegroundAssist(uint64_t window_id,
++                               ForegroundAssistReleaseReason reason,
++                               uint64_t expected_generation = 0);
+ 
+   // Lazily releases an expired lease (reason=timeout) and returns how many
+   // were released. Slice 1 owns no timer; callers may use this entry point,
+@@ -258,6 +264,12 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // first, so an expired lease never reports true.
+   bool IsForegroundAssistLeased(uint64_t window_id);
+ 
++  // request_seq of the live lease covering `window_id`, or 0 when no live
++  // lease covers it (including just-expired leases: this sweeps first). The
++  // timeout/release owners use it to verify that the lease they act on is
++  // still the generation they track (ABA guard).
++  uint64_t GetForegroundAssistLeaseGeneration(uint64_t window_id);
++
+   // Testing helpers. Reset restores the uninitialized (switch-driven) state.
+   void ResetForTesting();
+   void SetManagedModeEnabledForTesting(bool enabled);
+@@ -296,8 +308,9 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+                    const char* reason);
+ 
+   // Releases the lease when it covers `window_id`, logging the transition.
+-  void ReleaseForegroundAssistLocked(uint64_t window_id,
+-                                     ForegroundAssistReleaseReason reason);
++  bool ReleaseForegroundAssistLocked(uint64_t window_id,
++                                     ForegroundAssistReleaseReason reason,
++                                     uint64_t expected_generation);
+   // Releases an expired lease, if any, and returns the number released.
+   size_t ReleaseExpiredForegroundAssistLeasesLocked();
+   base::TimeTicks Now() const;
+diff --git a/ui/views/widget/browser_cli_presentation_policy_unittest.cc b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+index 6d9115f5d3..b3f18fbca8 100644
+--- a/ui/views/widget/browser_cli_presentation_policy_unittest.cc
++++ b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+@@ -658,6 +658,65 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   EXPECT_EQ(RequestAssist(100), ForegroundAssistRequestResult::kGranted);
+ }
+ 
++// P0 ABA regression: the generation of a lease is observable, sweeps expired
++// leases first and is stable across an idempotent re-request.
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistLeaseGenerationIsReportedAndSwept) {
++  EnableManagedModeAt(TestNow());
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(45), 0u);
++
++  ASSERT_EQ(RequestAssist(45), ForegroundAssistRequestResult::kGranted);
++  const uint64_t first = policy()->GetForegroundAssistLeaseGeneration(45);
++  EXPECT_GT(first, 0u);
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(46), 0u);
++
++  // An idempotent re-request keeps the same lease and generation.
++  ASSERT_EQ(RequestAssist(45), ForegroundAssistRequestResult::kGranted);
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(45), first);
++
++  // A lease that expired lazily reports no generation.
++  AdvanceClock(kDefaultForegroundAssistLeaseTtl);
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(45), 0u);
++}
++
++// P0 ABA regression: a release that names an older generation must never
++// release the generation that replaced it for the same window.
++TEST_F(BrowserCliPresentationPolicyTest,
++       AssistReleaseWithGenerationNeverTouchesANewerLease) {
++  EnableManagedModeAt(TestNow());
++  ASSERT_EQ(RequestAssist(55), ForegroundAssistRequestResult::kGranted);
++  const uint64_t first = policy()->GetForegroundAssistLeaseGeneration(55);
++  ASSERT_GT(first, 0u);
++
++  // A stale generation is refused and the live lease survives.
++  EXPECT_FALSE(policy()->ReleaseForegroundAssist(
++      55, ForegroundAssistReleaseReason::kAgentRelease, first + 1));
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(55));
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(55), first);
++
++  // The matching generation is released.
++  EXPECT_TRUE(policy()->ReleaseForegroundAssist(
++      55, ForegroundAssistReleaseReason::kAgentRelease, first));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(55));
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(55), 0u);
++
++  // A new lease mints a new generation; the old release request cannot kill it.
++  AdvanceClock(base::Seconds(1));
++  ASSERT_EQ(RequestAssist(55), ForegroundAssistRequestResult::kGranted);
++  const uint64_t second = policy()->GetForegroundAssistLeaseGeneration(55);
++  EXPECT_GT(second, first);
++  EXPECT_FALSE(policy()->ReleaseForegroundAssist(
++      55, ForegroundAssistReleaseReason::kAgentRelease, first));
++  EXPECT_EQ(policy()->GetForegroundAssistLeaseGeneration(55), second);
++  EXPECT_TRUE(policy()->IsForegroundAssistLeased(55));
++
++  // Generation 0 keeps the "release whatever is current" behavior used by
++  // user takeover and window destruction.
++  EXPECT_TRUE(policy()->ReleaseForegroundAssist(
++      55, ForegroundAssistReleaseReason::kWindowDestroyed));
++  EXPECT_FALSE(policy()->IsForegroundAssistLeased(55));
++}
++
+ TEST_F(BrowserCliPresentationPolicyTest,
+        AssistUserTakeoverReleasesLeaseThenGrantsHuman) {
+   EnableManagedModeAt(TestNow());

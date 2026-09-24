@@ -1,0 +1,394 @@
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index a3bfac657d..7dbdc6340c 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -158,6 +158,7 @@
+ #include "ui/menus/cocoa/menu_controller.h"
+ #include "ui/native_theme/native_theme.h"
+ #include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
++#include "ui/views/widget/browser_cli_foreground_origin.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -1777,6 +1778,16 @@ - (void)executeCommand:(id)sender withProfile:(Profile*)profile {
+     return;
+   }
+ 
++  // Browser CLI: this method is only reached from the AppKit menu dispatch
++  // (-commandDispatch: / -commandFromDock:), which is a real user gesture.
++  // Attribute the window operations it performs (activating/restoring an
++  // existing window, showing a dialog in it) to the trusted Chrome UI origin:
++  // the unattributed default (ForegroundOrigin::kUnknown) is denied on a
++  // HUMAN-owned window, and the user's own menu actions must never be blocked
++  // by the AI background policy.
++  views::ScopedForegroundOrigin browser_cli_user_ui(
++      views::ForegroundOrigin::kInternal);
++
+   NSInteger tag = [sender tag];
+ 
+   switch (tag) {
+@@ -1934,6 +1945,20 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   if (hasVisibleWindows) {
+     NSSet<NSWindow*>* browserWindows = GetBrowserWindows();
+     if (browserWindows.count) {
++      // TODO(browser-cli/p0-assist-dock-takeover): this upstream branch only
++      // focuses the window set and never attributes USER_EXPLICIT. When the
++      // focused window is a visible ASSIST-leased window, the user's Dock click
++      // therefore does not upgrade it to HUMAN, does not release the lease and
++      // does not cancel the foreground-assist timeout: the pending deadline (or
++      // an agent release) can still hide the window the user is operating.
++      // Call chain: applicationShouldHandleReopen: (hasVisibleWindows=YES)
++      // -> FocusWindowSetOnCurrentSpace -> -[NSWindow makeKeyAndOrderFront:]
++      // directly, bypassing browser_cli::PresentExistingWindowForUserExplicitAction
++      // and ui/views/widget NativeWidgetMacNSWindowHost::PresentForUserExplicitAction,
++      // so BrowserCliPresentationPolicy never sees a kUserExplicit request and
++      // ForegroundAssistController::OnLeaseReleasedByUserTakeover is never
++      // called. Tracked as its own P0; do not fold the behavior fix into this
++      // patch.
+       FocusWindowSetOnCurrentSpace(browserWindows);
+       LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
+                                       browser_cli_reopen_start, "reopen-exit",
+@@ -2213,6 +2238,11 @@ - (IBAction)showPreferencesForProfile:(Profile*)profile {
+     // Failed to load profile, show Profile Picker instead.
+     return;
+   }
++  // Browser CLI: AppKit menu callback (user gesture); trusted Chrome UI origin
++  // so activating the user's HUMAN-owned window is not denied. See
++  // -executeCommand:withProfile:.
++  views::ScopedForegroundOrigin browser_cli_user_ui(
++      views::ForegroundOrigin::kInternal);
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+     chrome::ShowSettings(browser);
+@@ -2235,6 +2265,11 @@ - (IBAction)orderFrontStandardAboutPanelForProfile:(Profile*)profile {
+     // Failed to load profile, show Profile Picker instead.
+     return;
+   }
++  // Browser CLI: AppKit menu callback (user gesture); trusted Chrome UI origin
++  // so activating the user's HUMAN-owned window is not denied. See
++  // -executeCommand:withProfile:.
++  views::ScopedForegroundOrigin browser_cli_user_ui(
++      views::ForegroundOrigin::kInternal);
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+     chrome::ShowAboutChrome(browser);
+diff --git a/ui/views/widget/browser_cli_presentation_policy.cc b/ui/views/widget/browser_cli_presentation_policy.cc
+index d53efccfc8..cb3dadadc1 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.cc
++++ b/ui/views/widget/browser_cli_presentation_policy.cc
+@@ -13,6 +13,8 @@ namespace {
+ 
+ const char* OriginToString(ForegroundOrigin origin) {
+   switch (origin) {
++    case ForegroundOrigin::kUnknown:
++      return "unknown";
+     case ForegroundOrigin::kUserExplicit:
+       return "user-explicit";
+     case ForegroundOrigin::kAgentAssist:
+@@ -85,10 +87,15 @@ bool IsForegroundAssistAllowedAction(BrowserCliPresentationAction action) {
+ }
+ 
+ // Automation origins may never act on a window the user explicitly owns
+-// (invariant 5.3). `kInternal` is deliberately not an automation origin: it is
+-// the un-attributed catch-all used by Chrome UI and native user flows.
++// (invariant 5.3). `kUnknown` is the default no-provenance origin and is
++// deliberately treated like automation: an unattributed caller must not gain
++// powers just because no producer identified it. `kInternal` is deliberately
++// not an automation origin, but it is only reached when a proven user-interface
++// code path scopes it explicitly (ScopedForegroundOrigin); nothing defaults to
++// it.
+ bool IsAutomationOrigin(ForegroundOrigin origin) {
+   switch (origin) {
++    case ForegroundOrigin::kUnknown:
+     case ForegroundOrigin::kAgentAssist:
+     case ForegroundOrigin::kExtension:
+     case ForegroundOrigin::kWebPage:
+@@ -103,9 +110,11 @@ bool IsAutomationOrigin(ForegroundOrigin origin) {
+ // The origin attributed to presentation requests on the current thread.
+ // Deliberately a single thread-local in this component: producers outside it
+ // only see the scoped setter, so there is exactly one policy and one
+-// attribution state per process.
++// attribution state per process. The default fails closed as `kUnknown`: a
++// request that no producer scoped carries no provenance and is treated like
++// automation by the policy.
+ thread_local ForegroundOrigin g_current_foreground_origin =
+-    ForegroundOrigin::kInternal;
++    ForegroundOrigin::kUnknown;
+ 
+ }  // namespace
+ 
+@@ -194,8 +203,10 @@ bool BrowserCliPresentationPolicy::AllowPresentation(
+     allow = false;
+     reason = "human-owned-window-automation-denied";
+   } else if (owned) {
+-    // Chrome UI and native user flows that cannot be attributed further stay
+-    // allowed on the user's own window.
++    // Only explicitly scoped trusted Chrome UI reaches this branch on the
++    // user's own window (kUserExplicit was handled above; `kUnknown` was
++    // classified as automation). The user's own menu/UI actions must not be
++    // blocked by the AI policy.
+     allow = true;
+     reason = "human-owned-window-internal-allowed";
+   } else if (leased) {
+@@ -437,7 +448,7 @@ void BrowserCliPresentationPolicy::ResetForTesting() {
+   active_foreground_assist_lease_.reset();
+   assist_request_seq_ = 0;
+   now_for_testing_ = base::TimeTicks();
+-  g_current_foreground_origin = ForegroundOrigin::kInternal;
++  g_current_foreground_origin = ForegroundOrigin::kUnknown;
+ }
+ 
+ void BrowserCliPresentationPolicy::SetManagedModeEnabledForTesting(
+diff --git a/ui/views/widget/browser_cli_presentation_policy.h b/ui/views/widget/browser_cli_presentation_policy.h
+index d32d2c0e11..485f34eec5 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.h
++++ b/ui/views/widget/browser_cli_presentation_policy.h
+@@ -65,6 +65,13 @@ inline constexpr char kBrowserCliBackgroundPresentationSwitch[] =
+ // section 3). Values are stable model vocabulary; adding a producer for an
+ // existing value must not change how the other origins are treated.
+ enum class ForegroundOrigin {
++  // Default origin of every request that no producer attributed. Provenance is
++  // unknown, so the policy fails closed and treats it exactly like automation:
++  // it may never act on a HUMAN-owned window (invariant 5.3), never present an
++  // unowned background window and never use a foreground assist lease. Only a
++  // producer that can prove its call chain may scope a stronger origin around
++  // its request (ScopedForegroundOrigin).
++  kUnknown,
+   // Dock / Launchpad / app reopen / menu bar / CLI explicit `show`.
+   kUserExplicit,
+   // Reserved (Phase 4): requestForeground for login / captcha / confirmation.
+@@ -73,7 +80,11 @@ enum class ForegroundOrigin {
+   kExtension,
+   // Renderer-requested presentation (`window.open` focus, windowing controls).
+   kWebPage,
+-  // Browser-internal maintenance, capture, recovery and Chrome UI.
++  // Trusted Chrome user interface, explicitly scoped around a user-gesture
++  // code path (for example the AppKit menu dispatch). A HUMAN-owned window
++  // keeps answering this origin for every action: the user's own Chrome UI must
++  // not be blocked by the AI policy. This is never the default and must not be
++  // set on unattributed or asynchronous calls, which stay kUnknown.
+   kInternal,
+   // Session restore.
+   kSessionRestore,
+@@ -170,12 +181,13 @@ class VIEWS_EXPORT BrowserCliPresentationPolicy {
+   // A `kUserExplicit` request is always allowed and additionally establishes
+   // per-window USER_EXPLICIT/HUMAN ownership for `window_id`.
+   //
+-  // A HUMAN-owned window answers `kInternal` requests (Chrome UI and native
+-  // user flows that cannot be attributed further, for example the user-facing
+-  // "Minimize window" action) and denies every automation origin (kAgentAssist
+-  // / kExtension / kWebPage / kSessionRestore) for every action: automation
+-  // must not show, minimize, re-show, restore, maximize, fullscreen,
+-  // deactivate, move or resize a window the user owns (invariant 5.3).
++  // A HUMAN-owned window answers explicitly scoped trusted Chrome UI
++  // (`kInternal`, for example the AppKit menu dispatch) and denies every other
++  // non-user origin - automation (kAgentAssist / kExtension / kWebPage /
++  // kSessionRestore) as well as the unattributed default (kUnknown) - for
++  // every action: neither automation nor a request with unknown provenance may
++  // show, minimize, re-show, restore, maximize, fullscreen, deactivate, move,
++  // resize or re-order a window the user owns (invariant 5.3).
+   //
+   // A window covered by a live foreground assist lease answers the lease's own
+   // show actions (kShowAndActivate / kShowInactive / kSetBounds) for
+diff --git a/ui/views/widget/browser_cli_presentation_policy_unittest.cc b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+index b48f0d85d1..6d9115f5d3 100644
+--- a/ui/views/widget/browser_cli_presentation_policy_unittest.cc
++++ b/ui/views/widget/browser_cli_presentation_policy_unittest.cc
+@@ -23,9 +23,13 @@ constexpr BrowserCliPresentationAction kAllActions[] = {
+     BrowserCliPresentationAction::kSetBounds,
+     BrowserCliPresentationAction::kSetZOrder};
+ 
++// Origins that may never act on a HUMAN-owned window. `kUnknown` is the
++// default no-provenance origin (P0 origin fail-closed): an unattributed caller
++// is treated exactly like automation on the user's window.
+ constexpr ForegroundOrigin kAutomationOrigins[] = {
+-    ForegroundOrigin::kAgentAssist, ForegroundOrigin::kExtension,
+-    ForegroundOrigin::kWebPage, ForegroundOrigin::kSessionRestore};
++    ForegroundOrigin::kUnknown, ForegroundOrigin::kAgentAssist,
++    ForegroundOrigin::kExtension, ForegroundOrigin::kWebPage,
++    ForegroundOrigin::kSessionRestore};
+ 
+ // Non-null epoch for the pinned test clock (lazy lease expiry).
+ base::TimeTicks TestNow() {
+@@ -101,9 +105,9 @@ TEST_F(BrowserCliPresentationPolicyTest,
+             BrowserCliPresentationState::kBackground);
+ 
+   const ForegroundOrigin non_user_origins[] = {
+-      ForegroundOrigin::kInternal, ForegroundOrigin::kAgentAssist,
+-      ForegroundOrigin::kExtension, ForegroundOrigin::kWebPage,
+-      ForegroundOrigin::kSessionRestore};
++      ForegroundOrigin::kUnknown,     ForegroundOrigin::kInternal,
++      ForegroundOrigin::kAgentAssist, ForegroundOrigin::kExtension,
++      ForegroundOrigin::kWebPage,     ForegroundOrigin::kSessionRestore};
+ 
+   for (ForegroundOrigin origin : non_user_origins) {
+     for (BrowserCliPresentationAction action : kAllActions) {
+@@ -164,9 +168,9 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   EXPECT_TRUE(policy()->IsUserExplicitOwned(1));
+   EXPECT_EQ(policy()->user_explicit_owned_window_count_for_testing(), 1u);
+ 
+-  // The user's window keeps responding to un-attributed Chrome-internal
+-  // requests (menu/button flows that cannot be attributed further), for every
+-  // action.
++  // The user's window keeps responding to explicitly scoped trusted Chrome UI
++  // (the AppKit menu dispatch), for every action. The unattributed default is
++  // kUnknown and is denied instead (see kAutomationOrigins below).
+   for (BrowserCliPresentationAction action : kAllActions) {
+     EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/1))
+         << "action=" << static_cast<int>(action);
+@@ -282,7 +286,7 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   }
+ 
+   // Denied automation requests must not release the user's ownership, and
+-  // un-attributed internal requests stay allowed for every action.
++  // explicitly scoped trusted Chrome UI stays allowed for every action.
+   EXPECT_TRUE(policy()->IsUserExplicitOwned(11));
+   for (BrowserCliPresentationAction action : kAllActions) {
+     EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, /*window_id=*/11))
+@@ -290,9 +294,82 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   }
+ }
+ 
++// P0 origin fail-closed regression: exactly what the host sees for a call that
++// no producer scoped. Every action must be denied on a HUMAN-owned window, and
++// the denial must not release the user's ownership.
+ TEST_F(BrowserCliPresentationPolicyTest,
+-       ForegroundOriginScopeDefaultsToInternal) {
+-  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++       UnattributedDefaultOriginIsDeniedOnHumanOwnedWindowForEveryAction) {
++  policy()->SetManagedModeEnabledForTesting(true);
++  ASSERT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/12));
++
++  // No ScopedForegroundOrigin anywhere on the stack: the ambient origin is the
++  // fail-closed default, not kInternal.
++  ASSERT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kUnknown);
++  for (BrowserCliPresentationAction action : kAllActions) {
++    EXPECT_FALSE(Allow(CurrentForegroundOrigin(), action, /*window_id=*/12))
++        << "action=" << static_cast<int>(action);
++  }
++
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(12));
++  EXPECT_EQ(policy()->window_state_for_testing(12),
++            BrowserCliPresentationState::kHuman);
++}
++
++// The explicit user entries (Dock / Launchpad / app reopen / CLI `show`) keep
++// winning on their own window, and only that window.
++TEST_F(BrowserCliPresentationPolicyTest,
++       UserExplicitEntryStaysAllowedWhileTheDefaultOriginIsDenied) {
++  policy()->SetManagedModeEnabledForTesting(true);
++
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/13));
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(13));
++  EXPECT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/14));
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(14));
++
++  // A third window has no user action behind it: the default origin only gets
++  // the proven non-presenting bounds change, nothing that could present it.
++  for (BrowserCliPresentationAction action : kAllActions) {
++    const bool expected_allow =
++        action == BrowserCliPresentationAction::kSetBounds;
++    EXPECT_EQ(Allow(CurrentForegroundOrigin(), action, /*window_id=*/15),
++              expected_allow)
++        << "action=" << static_cast<int>(action);
++  }
++}
++
++// Manual entry points: on macOS the user's native minimize / zoom / fullscreen
++// go straight to AppKit and never reach this policy, and Chrome menu code that
++// does perform programmatic window operations scopes the trusted Chrome UI
++// origin explicitly (see -executeCommand:withProfile: in
++// app_controller_mac.mm). This pins that escape hatch: kInternal must keep
++// allowing every action on a HUMAN-owned window, otherwise the user's own UI
++// would be blocked.
++TEST_F(BrowserCliPresentationPolicyTest,
++       TrustedChromeUiOriginKeepsUserActionsAllowedOnHumanOwnedWindow) {
++  policy()->SetManagedModeEnabledForTesting(true);
++  ASSERT_TRUE(Allow(ForegroundOrigin::kUserExplicit,
++                    BrowserCliPresentationAction::kShowAndActivate,
++                    /*window_id=*/16));
++
++  ScopedForegroundOrigin chrome_ui_scope(ForegroundOrigin::kInternal);
++  for (BrowserCliPresentationAction action : kAllActions) {
++    EXPECT_TRUE(Allow(CurrentForegroundOrigin(), action, /*window_id=*/16))
++        << "action=" << static_cast<int>(action);
++  }
++  EXPECT_TRUE(policy()->IsUserExplicitOwned(16));
++}
++
++// P0 origin fail-closed: a request that no producer attributed must carry no
++// provenance, never the trusted Chrome UI origin.
++TEST_F(BrowserCliPresentationPolicyTest,
++       ForegroundOriginScopeDefaultsToUnknown) {
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kUnknown);
+ }
+ 
+ TEST_F(BrowserCliPresentationPolicyTest, ForegroundOriginScopeSetsAndRestores) {
+@@ -305,7 +382,7 @@ TEST_F(BrowserCliPresentationPolicyTest, ForegroundOriginScopeSetsAndRestores) {
+     }
+     EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kExtension);
+   }
+-  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kUnknown);
+ }
+ 
+ // Regression test for the `chrome.tabs.create` asynchronous window-creation
+@@ -318,13 +395,13 @@ TEST_F(BrowserCliPresentationPolicyTest, ForegroundOriginScopeSetsAndRestores) {
+ // bound callback and does not leak into later tasks.
+ TEST_F(BrowserCliPresentationPolicyTest,
+        BoundContinuationReattachesOriginWithoutLeaking) {
+-  ForegroundOrigin captured = ForegroundOrigin::kInternal;
++  ForegroundOrigin captured = ForegroundOrigin::kUnknown;
+   {
+     ScopedForegroundOrigin run_scope(ForegroundOrigin::kExtension);
+     captured = CurrentForegroundOrigin();
+   }
+   // The task hop: no scope is active anymore when the continuation runs.
+-  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kUnknown);
+ 
+   bool continuation_saw_extension = false;
+   base::OnceClosure continuation = base::BindOnce(
+@@ -338,7 +415,7 @@ TEST_F(BrowserCliPresentationPolicyTest,
+ 
+   EXPECT_TRUE(continuation_saw_extension);
+   // The continuation's scope must not outlive the callback.
+-  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kInternal);
++  EXPECT_EQ(CurrentForegroundOrigin(), ForegroundOrigin::kUnknown);
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -352,9 +429,9 @@ TEST_F(BrowserCliPresentationPolicyTest,
+   EnableManagedModeAt(TestNow());
+ 
+   const ForegroundOrigin non_agent_origins[] = {
+-      ForegroundOrigin::kUserExplicit, ForegroundOrigin::kExtension,
+-      ForegroundOrigin::kWebPage, ForegroundOrigin::kInternal,
+-      ForegroundOrigin::kSessionRestore};
++      ForegroundOrigin::kUserExplicit, ForegroundOrigin::kUnknown,
++      ForegroundOrigin::kExtension,    ForegroundOrigin::kWebPage,
++      ForegroundOrigin::kInternal,     ForegroundOrigin::kSessionRestore};
+   for (ForegroundOrigin origin : non_agent_origins) {
+     EXPECT_EQ(policy()->RequestForegroundAssist(origin, /*window_id=*/20,
+                                                 /*target_tab=*/0,
+@@ -491,10 +568,11 @@ TEST_F(BrowserCliPresentationPolicyTest,
+     EXPECT_TRUE(Allow(ForegroundOrigin::kInternal, action, 70))
+         << "action=" << static_cast<int>(action);
+   }
+-  // The lease never lets another automation origin ride along.
++  // The lease never lets another automation origin (or the unattributed
++  // default) ride along.
+   const ForegroundOrigin other_automation[] = {
+-      ForegroundOrigin::kExtension, ForegroundOrigin::kWebPage,
+-      ForegroundOrigin::kSessionRestore};
++      ForegroundOrigin::kUnknown, ForegroundOrigin::kExtension,
++      ForegroundOrigin::kWebPage, ForegroundOrigin::kSessionRestore};
+   for (ForegroundOrigin origin : other_automation) {
+     for (BrowserCliPresentationAction action : kAllActions) {
+       EXPECT_FALSE(Allow(origin, action, 70))

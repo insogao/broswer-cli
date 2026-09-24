@@ -1,7 +1,8 @@
 # Browser CLI
 
-项目持续状态与下一项调度统一查看 [`PROJECT-PROGRESS.md`](PROJECT-PROGRESS.md)。任何代理开始工作前，
-必须同时阅读该进度表、宏观设计和 `AGENTS.md`；完成单个阶段不代表停止整个项目跟进。
+新负责人请先看 [`HANDOVER-2026-09-24.md`](HANDOVER-2026-09-24.md)，再以
+[`PROJECT-PROGRESS.md`](PROJECT-PROGRESS.md) 为唯一动态进度来源。开始工作前还必须阅读宏观设计与
+[`AGENTS.md`](AGENTS.md)；本 README 的阶段快照较早，不覆盖进度表中的当前结论。
 
 面向 AI Agent 的 Chromium 浏览器运行时。宏观设计见 [`docs/browser-cli-development-plan.md`](docs/browser-cli-development-plan.md)。
 

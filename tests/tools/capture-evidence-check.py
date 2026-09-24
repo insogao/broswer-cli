@@ -7,7 +7,12 @@ report dir. It parses evidence produced by a (future) execution slice and
 applies fail-closed verdicts. Fake passes it rejects:
 
   * any on-screen window during the session (app-identity watcher max > 0);
-  * empty / blank / suspiciously small PNG captures;
+  * empty / blank / suspiciously small PNG captures: blank detection validates
+    IHDR and the exact scanline payload, then reverses the PNG scanline filters
+    0..4 (W3C PNG Third Edition §9) before measuring pixel uniformity, so a
+    blank capture encoded with Sub/Up/Average/Paeth filters is still caught and
+    filter bytes are never counted as pixels; unsupported-but-legal PNG formats
+    are unverifiable and can never PASS;
   * capture integrity failures (sha256 / size mismatch against the manifest);
   * the same pixels across different cases, or a dynamic / canvas / long-scroll
     case whose captures are all identical;
@@ -98,136 +103,484 @@ def sha256_file(path):
         return None
 
 
-def read_png(path):
-    """Header + payload level PNG validation (no full image decode).
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
-    Returns a dict with ok/width/height/size/blank/detail. `blank` is a
-    conservative heuristic: after zlib-decompressing the IDAT payload, at most
-    two distinct byte values with one value covering >95% of the bytes means a
-    uniform (blank) image. A blank capture is never acceptable evidence.
+# W3C PNG (Third Edition) §9: filter method 0 defines five per-scanline filters
+# (0 None, 1 Sub, 2 Up, 3 Average, 4 Paeth) that a decoder must reverse before
+# the scanline bytes are pixels. Chromium's Page.captureScreenshot PNG path
+# (page_handler.cc: EncodeBGRASkBitmap / FastEncodeBGRASkBitmap ->
+# SkPngRustEncoder -> rust/png FFI) writes either Filter::Up or Filter::Adaptive
+# (0..4 per row), so all five must be implemented; the compressed payload can
+# never be treated as pixels.
+PNG_FILTER_NONE = 0
+PNG_FILTER_SUB = 1
+PNG_FILTER_UP = 2
+PNG_FILTER_AVERAGE = 3
+PNG_FILTER_PAETH = 4
+PNG_FILTER_TYPES = (
+    PNG_FILTER_NONE,
+    PNG_FILTER_SUB,
+    PNG_FILTER_UP,
+    PNG_FILTER_AVERAGE,
+    PNG_FILTER_PAETH,
+)
+
+# Legal IHDR field values (W3C PNG Third Edition §4.1). Values outside these are
+# invalid; legal values outside the verified screenshot subset are
+# `unsupported` (unverifiable) and can never PASS.
+PNG_LEGAL_COLOR_TYPES = (0, 2, 3, 4, 6)
+PNG_LEGAL_BIT_DEPTHS = {
+    0: (1, 2, 4, 8, 16),
+    2: (8, 16),
+    3: (1, 2, 4, 8),
+    4: (8, 16),
+    6: (8, 16),
+}
+# Supported subset: 8-bit RGB/RGBA, non-interlaced, compression/filter method 0.
+# That is what Chromium screenshots can contain; everything else stays
+# unverifiable instead of being guessed.
+PNG_SUPPORTED_COLOR_TYPES = {2: ("RGB", 3), 6: ("RGBA", 4)}
+# Decoding bound: the expected scanline payload of a plausible screenshot is far
+# below this; anything larger is `unsupported` (never a guess).
+PNG_MAX_DECODE_BYTES = 128 * 1024 * 1024
+
+
+def _paeth_predictor(a, b, c):
+    """Paeth predictor (W3C PNG Third Edition §9.4)."""
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _blank_heuristic(pixels):
+    """Conservative uniformity heuristic, applied to reconstructed pixel bytes
+    (scanline filter bytes removed): at most two distinct byte values with one
+    value covering >95% of the bytes means a uniform (blank) image."""
+    if not pixels:
+        return False
+    counts = {}
+    for byte in pixels:
+        counts[byte] = counts.get(byte, 0) + 1
+    return len(counts) <= 2 and (max(counts.values()) / len(pixels)) > 0.95
+
+
+def decode_png(data):
+    """Decodes the supported PNG subset and validates the structure.
+
+    Returns a dict with `status`:
+      * "ok": IHDR/chunks/scanline payload are valid, the scanline filters
+        0..4 were reversed, and width/height/color_type/bit_depth/pixels
+        (reconstructed samples without filter bytes)/blank are set;
+      * "invalid": the bytes violate the PNG structure or IHDR/scanline rules
+        (truncated chunk, chunk CRC mismatch, non-consecutive IDAT chunks,
+        illegal field value, filter byte outside 0..4, scanline payload size
+        mismatch, broken zlib stream);
+      * "unsupported": legal PNG data outside the verified screenshot subset
+        (other color type/bit depth, interlaced, oversized). Callers must treat
+        it as unverifiable: never non-blank, never PASS.
+    """
+    size = len(data)
+    if size < 8 or data[:8] != PNG_MAGIC:
+        return {"status": "invalid", "size": size, "detail": "not a PNG (magic)"}
+    pos = 8
+    header = None
+    idat = b""
+    idat_state = "none"  # none -> started -> ended; IDAT chunks must be consecutive
+    seen_iend = False
+    while pos < size:
+        if pos + 8 > size:
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "truncated chunk header at offset %d" % pos,
+            }
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        tag = data[pos + 4 : pos + 8]
+        end = pos + 8 + length
+        if end + 4 > size:
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "truncated %s chunk (length %d)"
+                % (tag.decode("latin-1"), length),
+            }
+        # W3C PNG Third Edition §5.5: every chunk carries a CRC over the chunk
+        # type and the chunk data (the length field is excluded). Corrupted
+        # chunk bytes must fail closed even when the zlib stream and scanlines
+        # would still decode.
+        expected_crc = struct.unpack(">I", data[end : end + 4])[0]
+        actual_crc = zlib.crc32(data[pos + 4 : end]) & 0xFFFFFFFF
+        if expected_crc != actual_crc:
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "chunk CRC mismatch for %s at offset %d"
+                % (tag.decode("latin-1"), pos),
+            }
+        if header is None and tag != b"IHDR":
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "first chunk is not IHDR",
+            }
+        if tag == b"IHDR":
+            if header is not None:
+                return {"status": "invalid", "size": size, "detail": "duplicate IHDR"}
+            if length != 13:
+                return {
+                    "status": "invalid",
+                    "size": size,
+                    "detail": "IHDR length %d (must be 13)" % length,
+                }
+            header = struct.unpack(">IIBBBBB", data[pos + 8 : end])
+        elif tag == b"IDAT":
+            # §5.6 / §11.2.3: multiple IDAT chunks are allowed but must be
+            # consecutive; an ancillary chunk between two IDATs is invalid.
+            if idat_state == "ended":
+                return {
+                    "status": "invalid",
+                    "size": size,
+                    "detail": "non-consecutive IDAT chunks (ancillary chunk "
+                    "between IDATs)",
+                }
+            idat_state = "started"
+            idat += data[pos + 8 : end]
+        elif tag == b"IEND":
+            if length != 0:
+                return {
+                    "status": "invalid",
+                    "size": size,
+                    "detail": "IEND length %d (must be 0)" % length,
+                }
+            idat_state = "ended" if idat_state == "started" else idat_state
+            seen_iend = True
+            if end + 4 != size:
+                return {
+                    "status": "invalid",
+                    "size": size,
+                    "detail": "trailing bytes after IEND",
+                }
+            break
+        elif idat_state == "started":
+            # Any non-IDAT chunk ends the IDAT run (§5.6).
+            idat_state = "ended"
+        pos = end + 4
+    if header is None:
+        return {"status": "invalid", "size": size, "detail": "missing IHDR"}
+    if not seen_iend:
+        return {"status": "invalid", "size": size, "detail": "missing IEND"}
+
+    width, height, bit_depth, color_type, compression, filter_method, interlace = header
+    if width == 0 or height == 0:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "zero width/height in IHDR",
+        }
+    if color_type not in PNG_LEGAL_COLOR_TYPES:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "illegal color type %d" % color_type,
+        }
+    if bit_depth not in PNG_LEGAL_BIT_DEPTHS[color_type]:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "illegal bit depth %d for color type %d" % (bit_depth, color_type),
+        }
+    if compression != 0:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "illegal compression method %d (only 0 is defined)" % compression,
+        }
+    if filter_method != 0:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "illegal filter method %d (only 0 is defined)" % filter_method,
+        }
+    if interlace not in (0, 1):
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "illegal interlace method %d" % interlace,
+        }
+    if color_type not in PNG_SUPPORTED_COLOR_TYPES or bit_depth != 8 or interlace != 0:
+        return {
+            "status": "unsupported",
+            "size": size,
+            "width": width,
+            "height": height,
+            "detail": "unsupported PNG format (unverifiable): color type %d, "
+            "bit depth %d, interlace %d" % (color_type, bit_depth, interlace),
+        }
+
+    name, channels = PNG_SUPPORTED_COLOR_TYPES[color_type]
+    bpp = channels
+    stride = width * bpp
+    expected = height * (stride + 1)
+    if expected > PNG_MAX_DECODE_BYTES:
+        return {
+            "status": "unsupported",
+            "size": size,
+            "width": width,
+            "height": height,
+            "detail": "unsupported PNG size (unverifiable): %d decoded bytes" % expected,
+        }
+    if not idat:
+        return {"status": "invalid", "size": size, "detail": "no IDAT payload"}
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(idat, expected + 1)
+        if decompressor.unconsumed_tail or len(raw) > expected:
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "scanline payload larger than the expected %d bytes" % expected,
+            }
+        raw += decompressor.flush()
+    except zlib.error as exc:
+        return {"status": "invalid", "size": size, "detail": "bad IDAT: %s" % exc}
+    if not decompressor.eof:
+        return {"status": "invalid", "size": size, "detail": "truncated zlib stream"}
+    if decompressor.unused_data:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "trailing data after the zlib stream",
+        }
+    if len(raw) != expected:
+        return {
+            "status": "invalid",
+            "size": size,
+            "detail": "scanline payload size mismatch: expected %d, got %d "
+            "(truncated/excess)" % (expected, len(raw)),
+        }
+
+    rows = []
+    previous = bytes(stride)
+    offset = 0
+    for row_index in range(height):
+        filter_type = raw[offset]
+        if filter_type not in PNG_FILTER_TYPES:
+            return {
+                "status": "invalid",
+                "size": size,
+                "detail": "invalid filter type %d at row %d" % (filter_type, row_index),
+            }
+        row = bytearray(raw[offset + 1 : offset + 1 + stride])
+        if filter_type == PNG_FILTER_SUB:
+            for i in range(bpp, stride):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+        elif filter_type == PNG_FILTER_UP:
+            for i in range(stride):
+                row[i] = (row[i] + previous[i]) & 0xFF
+        elif filter_type == PNG_FILTER_AVERAGE:
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + ((left + previous[i]) >> 1)) & 0xFF
+        elif filter_type == PNG_FILTER_PAETH:
+            for i in range(stride):
+                left = row[i - bpp] if i >= bpp else 0
+                up = previous[i]
+                up_left = previous[i - bpp] if i >= bpp else 0
+                row[i] = (row[i] + _paeth_predictor(left, up, up_left)) & 0xFF
+        rows.append(bytes(row))
+        previous = rows[-1]
+        offset += stride + 1
+
+    pixels = b"".join(rows)
+    blank = _blank_heuristic(pixels)
+    return {
+        "status": "ok",
+        "ok": True,
+        "width": width,
+        "height": height,
+        "bit_depth": bit_depth,
+        "color_type": color_type,
+        "format": name,
+        "size": size,
+        "pixels": pixels,
+        "blank": blank,
+        "detail": "%s %dx%d, %d bytes%s" % (name, width, height, size, " BLANK" if blank else ""),
+    }
+
+
+def read_png(path):
+    """Reads a capture file and decodes the supported PNG subset.
+
+    Returns decode_png()'s dict (plus ok/size); `ok` is true only for a fully
+    validated and decoded supported image. Invalid or unsupported files are
+    fail-closed: the caller must never treat them as non-blank or PASS.
     """
     try:
         with open(path, "rb") as handle:
             data = handle.read()
     except OSError as exc:
-        return {"ok": False, "detail": "unreadable: %s" % exc}
-    size = len(data)
-    if size < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        return {"ok": False, "size": size, "detail": "not a PNG (magic)"}
-    pos = 8
-    width = height = None
-    idat = b""
-    while pos + 8 <= size:
-        length = struct.unpack(">I", data[pos : pos + 4])[0]
-        tag = data[pos + 4 : pos + 8]
-        chunk = data[pos + 8 : pos + 8 + length]
-        if len(chunk) != length:
-            return {"ok": False, "size": size, "detail": "truncated chunk"}
-        if tag == b"IHDR" and len(chunk) >= 8:
-            width, height = struct.unpack(">II", chunk[:8])
-        elif tag == b"IDAT":
-            idat += chunk
-        elif tag == b"IEND":
-            break
-        pos += 12 + length
-    if not width or not height:
-        return {"ok": False, "size": size, "detail": "missing/zero IHDR size"}
-    if not idat:
-        return {"ok": False, "size": size, "detail": "no IDAT payload"}
-    try:
-        raw = zlib.decompress(idat)
-    except zlib.error as exc:
-        return {"ok": False, "size": size, "detail": "bad IDAT: %s" % exc}
-    if not raw:
-        return {"ok": False, "size": size, "detail": "empty IDAT payload"}
-    counts = {}
-    for byte in raw:
-        counts[byte] = counts.get(byte, 0) + 1
-    blank = len(counts) <= 2 and (max(counts.values()) / len(raw)) > 0.95
-    return {
-        "ok": True,
-        "width": width,
-        "height": height,
-        "size": size,
-        "blank": blank,
-        "detail": "%dx%d, %d bytes%s" % (width, height, size, " BLANK" if blank else ""),
-    }
+        return {"status": "invalid", "ok": False, "detail": "unreadable: %s" % exc}
+    result = decode_png(data)
+    result.setdefault("size", len(data))
+    result["ok"] = result["status"] == "ok"
+    return result
 
 
 def parse_watcher(path):
     """Parses the app-identity watcher evidence.
 
-    The raw samples are authoritative: the reported maximum is the upper bound
-    of the per-sample counts and the `final max=` line. If the two disagree (for
-    example a `count=1` sample hidden behind `final max=0`), the evidence is
-    inconsistent and must never PASS. Returns a dict with readable/samples/
-    sample_max/final_max/max/nonzero_samples/consistent/malformed/
-    first_nonzero_index so the raw evidence survives into the report.
+    09:03 UTC Gate C watcher evidence contract (main-owner decision):
+      * at least one parseable raw `sample ts=<ms> count=<n>` line and exactly
+        one complete `final max=<n> nonzero_samples=<n>` line; all values must
+        be non-negative integers and the sample timestamps strictly increasing;
+      * missing raw samples or a missing final line -> the check is
+        NOT-EVALUATED (insufficient evidence, non-zero exit; final-only
+        evidence can never PASS);
+      * malformed lines, duplicate final lines, negative values, non-monotonic
+        timestamps and any sample/final disagreement (max or non-zero count)
+        -> CONTRADICTION;
+      * the raw samples stay authoritative: a final max=0 can never mask a
+        count>0 sample.
+
+    Returns a dict with readable/sample_lines/samples/sample_malformed/
+    sample_max/final_lines/final_max/final_malformed/max/nonzero_samples/
+    sample_nonzero_samples/timestamps_monotonic/consistent/malformed/
+    first_nonzero_index/contradiction_reason/missing_reason so the raw evidence
+    and the exact verdict survive into the report.
     """
-    samples = []
-    final_max = None
-    final_nonzero = None
-    malformed = 0
+    sample_timestamps = []
+    sample_counts = []
+    sample_lines = 0
+    sample_malformed = 0
+    final_lines = 0
+    final_values = []
+    final_malformed = 0
+    negative = False
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
                 if line.startswith("sample "):
+                    sample_lines += 1
                     fields = dict(
                         part.split("=", 1) for part in line.split()[1:] if "=" in part
                     )
+                    if "ts" not in fields or "count" not in fields:
+                        sample_malformed += 1
+                        continue
                     try:
-                        samples.append(int(fields.get("count", "")))
-                    except ValueError:
-                        malformed += 1
+                        timestamp = int(fields["ts"])
+                        count = int(fields["count"])
+                    except (TypeError, ValueError):
+                        sample_malformed += 1
+                        continue
+                    if timestamp < 0 or count < 0:
+                        negative = True
+                    sample_timestamps.append(timestamp)
+                    sample_counts.append(count)
                 elif line.startswith("final "):
+                    final_lines += 1
                     fields = dict(
                         part.split("=", 1) for part in line.split()[1:] if "=" in part
                     )
                     try:
-                        final_max = int(fields.get("max", ""))
-                    except ValueError:
-                        malformed += 1
-                    try:
-                        final_nonzero = int(fields.get("nonzero_samples", ""))
-                    except ValueError:
-                        final_nonzero = None
+                        final_max = int(fields["max"])
+                        final_nonzero = int(fields["nonzero_samples"])
+                    except (KeyError, TypeError, ValueError):
+                        final_malformed += 1
+                        continue
+                    if final_max < 0 or final_nonzero < 0:
+                        negative = True
+                    final_values.append((final_max, final_nonzero))
     except OSError:
         return {
             "readable": False,
+            "sample_lines": 0,
             "samples": 0,
+            "sample_malformed": 0,
             "sample_max": None,
+            "final_lines": 0,
             "final_max": None,
+            "final_malformed": 0,
             "max": None,
             "nonzero_samples": None,
             "sample_nonzero_samples": 0,
+            "timestamps_monotonic": False,
             "consistent": False,
             "malformed": 0,
             "first_nonzero_index": None,
+            "contradiction_reason": "",
+            "missing_reason": "watcher samples file not readable",
         }
-    sample_max = max(samples) if samples else None
-    sample_nonzero = sum(1 for count in samples if count > 0)
+
+    reasons = []
+    if sample_malformed:
+        reasons.append("%d malformed sample line(s)" % sample_malformed)
+    if final_malformed:
+        reasons.append("%d incomplete/malformed final line(s)" % final_malformed)
+    if final_lines > 1:
+        reasons.append("%d final lines (exactly one required)" % final_lines)
+    if negative:
+        reasons.append("negative watcher value(s)")
+
+    timestamps_monotonic = True
+    for previous, current in zip(sample_timestamps, sample_timestamps[1:]):
+        if current <= previous:
+            timestamps_monotonic = False
+            break
+    if sample_timestamps and not timestamps_monotonic:
+        reasons.append("sample timestamps are not strictly increasing")
+
+    sample_max = max(sample_counts) if sample_counts else None
+    sample_nonzero = sum(1 for count in sample_counts if count > 0)
+    # Exactly one complete final line is required; duplicates or malformed
+    # lines above already contribute a contradiction reason.
+    final_max = final_values[0][0] if len(final_values) == 1 else None
+    final_nonzero = final_values[0][1] if len(final_values) == 1 else None
+    if sample_max is not None and final_max is not None and sample_max != final_max:
+        reasons.append("sample_max=%s != final max=%s" % (sample_max, final_max))
+    if final_nonzero is not None and final_nonzero != sample_nonzero:
+        reasons.append(
+            "sample nonzero=%d != final nonzero_samples=%s"
+            % (sample_nonzero, final_nonzero)
+        )
+
+    missing = []
+    if sample_lines == 0:
+        missing.append("no raw sample lines (final-only evidence never passes)")
+    if final_lines == 0:
+        missing.append("no final line (max/nonzero_samples missing)")
+
     present = [value for value in (sample_max, final_max) if value is not None]
     max_seen = max(present) if present else None
-    consistent = malformed == 0 and (
-        sample_max is None or final_max is None or sample_max == final_max
-    )
-    if final_nonzero is not None and final_nonzero != sample_nonzero:
-        consistent = False
     first_nonzero = next(
-        (index for index, count in enumerate(samples) if count > 0), None
+        (index for index, count in enumerate(sample_counts) if count > 0), None
     )
+    contradiction_reason = "; ".join(reasons)
     return {
         "readable": True,
-        "samples": len(samples),
+        "sample_lines": sample_lines,
+        "samples": len(sample_counts),
+        "sample_malformed": sample_malformed,
         "sample_max": sample_max,
+        "final_lines": final_lines,
         "final_max": final_max,
+        "final_malformed": final_malformed,
         "max": max_seen,
         "nonzero_samples": final_nonzero,
         "sample_nonzero_samples": sample_nonzero,
-        "consistent": consistent,
-        "malformed": malformed,
+        "timestamps_monotonic": timestamps_monotonic,
+        "consistent": not contradiction_reason,
+        "malformed": sample_malformed + final_malformed,
         "first_nonzero_index": first_nonzero,
+        "contradiction_reason": contradiction_reason,
+        "missing_reason": "; ".join(missing),
     }
 
 
@@ -353,25 +706,22 @@ def evaluate(evidence_dir):
     # Gate C invariant: no on-screen window at any time. The raw sample maximum
     # and the final max= line must agree; the upper bound of both is
     # authoritative, so a final max=0 can never mask a count>0 sample.
-    if not watcher["readable"] or (
-        watcher["samples"] == 0 and watcher["final_max"] is None
-    ):
-        add("no-visible-window", "NOT-EVALUATED", "no watcher samples/final line")
-    elif not watcher["consistent"]:
+    #
+    # 09:03 UTC watcher evidence contract: raw samples and exactly one complete
+    # final line are mandatory (missing evidence -> NOT-EVALUATED, non-zero
+    # exit), and any malformed/duplicate/negative/non-monotonic/inconsistent
+    # form is a CONTRADICTION. A final-only file has zero raw samples and can
+    # therefore never PASS.
+    if not watcher["readable"]:
+        add("no-visible-window", "NOT-EVALUATED", watcher["missing_reason"])
+    elif watcher["contradiction_reason"]:
         add(
             "no-visible-window",
             "CONTRADICTION",
-            "watcher evidence inconsistent: sample_max=%s final_max=%s "
-            "malformed=%d nonzero(sample)=%s nonzero(final)=%s; the raw samples "
-            "are authoritative and a final max=0 must not mask an on-screen window"
-            % (
-                watcher["sample_max"],
-                watcher["final_max"],
-                watcher["malformed"],
-                watcher["sample_nonzero_samples"],
-                watcher["nonzero_samples"],
-            ),
+            "watcher evidence invalid: %s" % watcher["contradiction_reason"],
         )
+    elif watcher["missing_reason"]:
+        add("no-visible-window", "NOT-EVALUATED", watcher["missing_reason"])
     elif watcher["max"] > 0:
         add(
             "no-visible-window",
@@ -389,8 +739,13 @@ def evaluate(evidence_dir):
         add(
             "no-visible-window",
             "PASS",
-            "sample_max=0 final_max=0 samples=%d nonzero_samples=%s"
-            % (watcher["samples"], watcher["nonzero_samples"]),
+            "raw_samples=%d sample_max=0 final_max=0 nonzero_samples=%s "
+            "timestamps_monotonic=%s"
+            % (
+                watcher["samples"],
+                watcher["nonzero_samples"],
+                watcher["timestamps_monotonic"],
+            ),
         )
 
     # No presentation allow anywhere: screenshots must never be bought with a
@@ -473,6 +828,7 @@ def evaluate(evidence_dir):
             continue
         hashes = []
         problems = []
+        unsupported = []
         for entry in entries:
             path = entry.get("file", "")
             actual = sha256_file(path)
@@ -490,7 +846,14 @@ def evaluate(evidence_dir):
             if expected_size != actual_size:
                 problems.append("size mismatch for %s" % os.path.basename(path))
             png = read_png(path)
-            if not png.get("ok"):
+            if png.get("status") == "unsupported":
+                # Legal PNG outside the verified screenshot subset: never guess
+                # non-blank and never PASS; the case stays unverifiable.
+                unsupported.append(
+                    "%s unverifiable PNG: %s"
+                    % (os.path.basename(path), png.get("detail"))
+                )
+            elif png.get("status") != "ok":
                 problems.append(
                     "%s invalid PNG: %s" % (os.path.basename(path), png.get("detail"))
                 )
@@ -505,6 +868,9 @@ def evaluate(evidence_dir):
         case_hashes[name] = hashes
         if problems:
             add("capture-%s-integrity" % name, "CONTRADICTION", "; ".join(problems))
+            continue
+        if unsupported:
+            add("capture-%s-integrity" % name, "NOT-EVALUATED", "; ".join(unsupported))
             continue
         add(
             "capture-%s-integrity" % name,
@@ -697,13 +1063,18 @@ def render(report):
     lines.append("## Watcher (app identity, 10ms)")
     watcher = report["watcher"]
     lines.append(
-        "- samples=%s sample_max=%s final_max=%s max=%s consistent=%s "
-        "malformed=%s nonzero(sample)=%s nonzero(final)=%s first_nonzero_index=%s"
+        "- readable=%s sample_lines=%s samples=%s sample_max=%s final_lines=%s "
+        "final_max=%s max=%s timestamps_monotonic=%s consistent=%s malformed=%s "
+        "nonzero(sample)=%s nonzero(final)=%s first_nonzero_index=%s"
         % (
+            watcher["readable"],
+            watcher["sample_lines"],
             watcher["samples"],
             watcher["sample_max"],
+            watcher["final_lines"],
             watcher["final_max"],
             watcher["max"],
+            watcher["timestamps_monotonic"],
             watcher["consistent"],
             watcher["malformed"],
             watcher["sample_nonzero_samples"],
@@ -711,6 +1082,10 @@ def render(report):
             watcher["first_nonzero_index"],
         )
     )
+    if watcher["missing_reason"]:
+        lines.append("- missing: %s" % watcher["missing_reason"])
+    if watcher["contradiction_reason"]:
+        lines.append("- invalid: %s" % watcher["contradiction_reason"])
     lines.append("")
     lines.append("## Captures")
     if report["captures"]:
@@ -745,45 +1120,182 @@ def render(report):
 # Fixture self-test (no browser, no window, no keychain)
 # --------------------------------------------------------------------------
 
-def _png_bytes(pixels):
-    height = len(pixels)
-    width = len(pixels[0]) // 3
-    raw = b"".join(b"\x00" + bytes(row) for row in pixels)
+def _png_chunk(tag, data, crc_xor=0):
+    """Chunk bytes with the standard CRC over type + data (§5.5); `crc_xor`
+    lets negative fixtures write a deliberately wrong CRC."""
+    crc = (zlib.crc32(tag + data) ^ crc_xor) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+
+def _forward_filter_row(filter_type, row, previous, bpp):
+    """Forward scanline filter (encoder direction, W3C PNG §9.2 formulas).
+
+    The fixture encoder must stay independent from decode_png(): it subtracts
+    the predictor where the decoder adds it. The known-answer fixtures pin the
+    exact filtered bytes computed from the standard, so a predictor bug shared
+    by both directions cannot cancel out unnoticed.
+    """
+    if filter_type == PNG_FILTER_NONE:
+        return bytes(row)
+    out = bytearray(len(row))
+    for i in range(len(row)):
+        left = row[i - bpp] if i >= bpp else 0
+        up = previous[i] if previous is not None else 0
+        up_left = previous[i - bpp] if (previous is not None and i >= bpp) else 0
+        if filter_type == PNG_FILTER_SUB:
+            predictor = left
+        elif filter_type == PNG_FILTER_UP:
+            predictor = up
+        elif filter_type == PNG_FILTER_AVERAGE:
+            predictor = (left + up) >> 1
+        elif filter_type == PNG_FILTER_PAETH:
+            predictor = _paeth_predictor(left, up, up_left)
+        else:
+            raise ValueError("filter type must be 0..4, got %r" % (filter_type,))
+        out[i] = (row[i] - predictor) & 0xFF
+    return bytes(out)
+
+
+def _forward_filtered_rows(pixels, width, bpp, filters):
+    """Raw scanline stream (filter byte + filtered bytes per row)."""
+    stride = width * bpp
+    height = len(pixels) // stride if (width and bpp) else 0
+    out = bytearray()
+    previous = None
+    for y in range(height):
+        row = pixels[y * stride : (y + 1) * stride]
+        if isinstance(filters, (list, tuple)):
+            filter_type = filters[y % len(filters)]
+        else:
+            filter_type = filters
+        out.append(filter_type)
+        out += _forward_filter_row(filter_type, row, previous, bpp)
+        previous = row
+    return bytes(out)
+
+
+def _encode_png(pixels, width, bpp, filters, *, color_type=None, bit_depth=8,
+                compression=0, filter_method=0, interlace=0,
+                raw_override=None, idat_override=None, idat_chunks=1,
+                bad_crc_tags=(), ancillary_pre=(), ancillary_mid=(),
+                ancillary_post=()):
+    """Independent forward-filter PNG encoder (fixture/test helper only).
+
+    `pixels` are flat row-major samples; `filters` is one filter type for every
+    row or a per-row sequence. Negative fixtures may inject `raw_override`
+    (malformed scanline stream) or `idat_override` (broken zlib payload),
+    override IHDR fields, split the zlib stream into `idat_chunks` adjacent
+    IDAT chunks, place `(tag, data)` ancillary chunks before / between / after
+    the IDAT run, or write a deliberately wrong CRC for the tags listed in
+    `bad_crc_tags`. This helper never calls decode_png/read_png.
+    """
+    color_type = color_type if color_type is not None else (6 if bpp == 4 else 2)
+    height = len(pixels) // (width * bpp) if (width and bpp) else 0
+    if idat_override is not None:
+        idat = idat_override
+    else:
+        raw = (
+            raw_override
+            if raw_override is not None
+            else _forward_filtered_rows(pixels, width, bpp, filters)
+        )
+        idat = zlib.compress(raw)
+    if idat_chunks <= 1 or len(idat) < idat_chunks:
+        idat_parts = [idat]
+    else:
+        part_size = len(idat) // idat_chunks
+        idat_parts = [
+            idat[index * part_size : (index + 1) * part_size]
+            for index in range(idat_chunks - 1)
+        ]
+        idat_parts.append(idat[(idat_chunks - 1) * part_size :])
+    if ancillary_mid and len(idat_parts) < 2:
+        raise ValueError("ancillary_mid requires idat_chunks >= 2")
 
     def chunk(tag, data):
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return _png_chunk(
+            tag, data, crc_xor=0xFFFFFFFF if tag in bad_crc_tags else 0
         )
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(raw))
-        + chunk(b"IEND", b"")
+    ihdr = struct.pack(
+        ">IIBBBBB", width, height, bit_depth, color_type, compression,
+        filter_method, interlace,
     )
+    out = bytearray(PNG_MAGIC)
+    out += chunk(b"IHDR", ihdr)
+    for tag, data in ancillary_pre:
+        out += chunk(tag, data)
+    for index, part in enumerate(idat_parts):
+        out += chunk(b"IDAT", part)
+        if index == 0:
+            for tag, data in ancillary_mid:
+                out += chunk(tag, data)
+    for tag, data in ancillary_post:
+        out += chunk(tag, data)
+    out += chunk(b"IEND", b"")
+    return bytes(out)
 
 
-def _pixels(seed, width=24, height=24):
-    """Incompressible 24x24 pixels so the fixture PNG stays above the
+def _flip_last_chunk_crc(png, tag):
+    """Test-side walker: flips the final CRC byte of the last chunk with `tag`.
+
+    Independent fixture mutator (plain length walk, no decode_png logic), used
+    to corrupt exactly one chunk CRC without touching its data.
+    """
+    pos = 8
+    crc_offset = None
+    while pos + 8 <= len(png):
+        length = struct.unpack(">I", png[pos : pos + 4])[0]
+        if png[pos + 4 : pos + 8] == tag:
+            crc_offset = pos + 8 + length
+        pos += 12 + length
+    if crc_offset is None:
+        raise ValueError("no %r chunk to corrupt" % (tag,))
+    flipped = bytearray(png)
+    flipped[crc_offset] ^= 0xFF
+    return bytes(flipped)
+
+
+class _RawPng:
+    """Marks prebuilt PNG file bytes in a capture plan (negative fixtures).
+
+    Plain `bytes`/`bytearray` values in a capture plan are flat pixel samples
+    that the fixture encoder must filter; this wrapper carries already-encoded
+    PNG file bytes so the two can never be confused.
+    """
+
+    def __init__(self, data):
+        self.data = bytes(data)
+
+
+def _png_bytes(pixels, width=24, bpp=3, filters=None, **kwargs):
+    """RGB/RGBA fixture PNG. By default every scanline filter 0..4 is exercised,
+    so the production decoder always runs through the forward/inverse pair."""
+    if filters is None:
+        filters = tuple(range(5))
+    return _encode_png(bytes(pixels), width, bpp, filters, **kwargs)
+
+
+def _pixels(seed, width=24, height=24, bpp=3):
+    """Incompressible flat row-major pixels so the fixture PNG stays above the
     suspicious-size threshold; the same seed yields byte-identical captures."""
     import random
 
     rng = random.Random(seed)
-    return [list(rng.randbytes(width * 3)) for _ in range(height)]
+    return rng.randbytes(width * height * bpp)
 
 
-def _blank_pixels(width=24, height=24):
-    return [[255, 255, 255] * width for _ in range(height)]
+def _blank_pixels(width=24, height=24, bpp=3, value=255):
+    return bytes([value]) * (width * height * bpp)
 
 
 def build_fixture(root, session=(True, True, True), cases=None, capture_plan=None,
-                  watcher=(0, 0), policy=True, page_content=True):
+                  watcher=(0, 0), watcher_lines=None, policy=True,
+                  page_content=True):
     """Writes a synthetic evidence dir. `capture_plan` maps case name -> list of
-    pixel grids (or the string "blank" / "empty")."""
+    pixel grids (or the string "blank" / "empty"). `watcher` writes a valid
+    (sample max, final nonzero) pair; `watcher_lines` writes the given raw
+    watcher lines verbatim for contract negatives (takes precedence)."""
     os.makedirs(os.path.join(root, "captures"), exist_ok=True)
     if cases is None:
         cases = [
@@ -824,6 +1336,9 @@ def build_fixture(root, session=(True, True, True), cases=None, capture_plan=Non
                 data = b""
             elif grid == "blank":
                 data = _png_bytes(_blank_pixels())
+            elif isinstance(grid, _RawPng):
+                # Prebuilt PNG bytes (negative/unsupported-format fixtures).
+                data = grid.data
             else:
                 data = _png_bytes(grid)
             with open(path, "wb") as handle:
@@ -844,7 +1359,10 @@ def build_fixture(root, session=(True, True, True), cases=None, capture_plan=Non
             )
     with open(os.path.join(root, CAPTURES_FILE), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
-    if watcher is not None:
+    if watcher_lines is not None:
+        with open(os.path.join(root, WATCHER_FILE), "w", encoding="utf-8") as handle:
+            handle.write("\n".join(watcher_lines) + "\n")
+    elif watcher is not None:
         with open(os.path.join(root, WATCHER_FILE), "w", encoding="utf-8") as handle:
             handle.write("sample ts=1 count=0\n")
             handle.write("sample ts=2 count=%d\n" % watcher[0])
@@ -1242,6 +1760,451 @@ def run_self_test():
             _status(report, "no-visible-window") == "CONTRADICTION"
             and evidence_exit_code(report) != 0,
             _status(report, "no-visible-window"),
+        )
+
+        # 17. 09:03 UTC watcher evidence contract: raw samples and exactly one
+        #     complete final are mandatory; malformed/duplicate/negative/
+        #     non-monotonic/inconsistent evidence is a CONTRADICTION; a
+        #     final-only file can never PASS.
+        def watcher_report(name, lines):
+            return evaluate(fixture(name, watcher_lines=lines))
+
+        def watcher_status(report):
+            return "%s rc=%s" % (
+                _status(report, "no-visible-window"),
+                evidence_exit_code(report),
+            )
+
+        report = watcher_report("watcher-final-only", ["final max=0 nonzero_samples=0"])
+        check(
+            "final-only watcher (zero raw samples) is NOT-EVALUATED, rc=3",
+            _status(report, "no-visible-window") == "NOT-EVALUATED"
+            and evidence_exit_code(report) == 3,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-no-final", ["sample ts=1 count=0", "sample ts=2 count=0"]
+        )
+        check(
+            "raw samples without a final line are NOT-EVALUATED, rc=3",
+            _status(report, "no-visible-window") == "NOT-EVALUATED"
+            and evidence_exit_code(report) == 3,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-malformed-sample",
+            ["sample ts=1 count=x", "sample ts=2 count=0",
+             "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "malformed sample line is a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-sample-without-ts",
+            ["sample count=0", "sample ts=2 count=0",
+             "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "sample line without ts is a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-duplicate-final",
+            ["sample ts=1 count=0", "sample ts=2 count=0",
+             "final max=0 nonzero_samples=0", "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "duplicate final lines are a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-incomplete-final",
+            ["sample ts=1 count=0", "sample ts=2 count=0", "final max=0"],
+        )
+        check(
+            "incomplete final (missing nonzero_samples) is a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-negative-sample",
+            ["sample ts=1 count=-1", "sample ts=2 count=0",
+             "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "negative sample count is a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-negative-final",
+            ["sample ts=1 count=0", "sample ts=2 count=0",
+             "final max=-1 nonzero_samples=0"],
+        )
+        check(
+            "negative final max is a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-non-monotonic",
+            ["sample ts=2 count=0", "sample ts=1 count=0",
+             "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "non-increasing sample timestamps are a CONTRADICTION, rc=1",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-nonzero-mismatch",
+            ["sample ts=1 count=1", "sample ts=2 count=0",
+             "final max=1 nonzero_samples=0"],
+        )
+        check(
+            "final nonzero_samples disagreeing with raw samples is a CONTRADICTION",
+            _status(report, "no-visible-window") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            watcher_status(report),
+        )
+        report = watcher_report(
+            "watcher-valid-raw",
+            ["sample ts=100 count=0", "sample ts=110 count=0",
+             "sample ts=120 count=0", "final max=0 nonzero_samples=0"],
+        )
+        check(
+            "real raw samples max=0 with a complete final PASSes the watcher check",
+            _status(report, "no-visible-window") == "PASS"
+            and evidence_exit_code(report) == 0,
+            watcher_status(report),
+        )
+
+        # 18. PNG scanline filters 0..4: the fixture encoder implements the
+        #     forward formulas independently; the known-answer literals pin the
+        #     exact filtered bytes computed from W3C PNG Third Edition §9.2, so
+        #     a predictor bug shared with the decoder cannot cancel out.
+        kat_pixels = bytes([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120])
+        kat_filtered_rows = {
+            0: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            1: [10, 20, 30, 30, 30, 30, 70, 80, 90, 30, 30, 30],
+            2: [10, 20, 30, 40, 50, 60, 60, 60, 60, 60, 60, 60],
+            3: [10, 20, 30, 35, 40, 45, 65, 70, 75, 45, 45, 45],
+            4: [10, 20, 30, 30, 30, 30, 60, 60, 60, 30, 30, 30],
+        }
+        for filter_type, filtered in kat_filtered_rows.items():
+            expected_raw = (
+                bytes([filter_type])
+                + bytes(filtered[:6])
+                + bytes([filter_type])
+                + bytes(filtered[6:])
+            )
+            actual_raw = _forward_filtered_rows(
+                kat_pixels, 2, 3, [filter_type, filter_type]
+            )
+            check(
+                "KAT filter %d forward bytes match the W3C formula" % filter_type,
+                actual_raw == expected_raw,
+                "raw=%s expected=%s" % (list(actual_raw), list(expected_raw)),
+            )
+            decoded = decode_png(
+                _encode_png(kat_pixels, 2, 3, [filter_type, filter_type])
+            )
+            check(
+                "KAT filter %d decodes back to the exact pixels" % filter_type,
+                decoded.get("status") == "ok" and decoded.get("pixels") == kat_pixels,
+                decoded.get("detail"),
+            )
+
+        # 19. Uniform images must be blank for every filter and both supported
+        #     color types; non-uniform pixels must never be misjudged blank.
+        for color_type, bpp, name in ((2, 3, "RGB"), (6, 4, "RGBA")):
+            uniform = _blank_pixels(bpp=bpp)
+            for filter_type in range(5):
+                decoded = decode_png(_encode_png(uniform, 24, bpp, filter_type))
+                check(
+                    "uniform %s with filter %d is blank after unfiltering"
+                    % (name, filter_type),
+                    decoded.get("status") == "ok"
+                    and decoded.get("blank") is True
+                    and decoded.get("pixels") == uniform,
+                    decoded.get("detail"),
+                )
+            varied = _pixels(100 + color_type, bpp=bpp)
+            for filter_type in range(5):
+                decoded = decode_png(_encode_png(varied, 24, bpp, filter_type))
+                check(
+                    "non-uniform %s with filter %d is not blank" % (name, filter_type),
+                    decoded.get("status") == "ok"
+                    and decoded.get("blank") is False
+                    and decoded.get("pixels") == varied,
+                    decoded.get("detail"),
+                )
+
+        # 20. Filter bytes are never pixels: the raw stream of a uniform image
+        #     with mixed filters has >2 distinct byte values, yet the decoded
+        #     image must still be blank (the old byte-frequency-on-raw heuristic
+        #     would have missed this blank capture).
+        white_rgba = _blank_pixels(bpp=4)
+        mixed_filters = tuple(range(5))
+        mixed_raw = _forward_filtered_rows(white_rgba, 24, 4, mixed_filters)
+        decoded = decode_png(_encode_png(white_rgba, 24, 4, mixed_filters))
+        check(
+            "blank detection ignores filter bytes (raw has >2 distinct bytes)",
+            decoded.get("status") == "ok"
+            and decoded.get("blank") is True
+            and len(set(mixed_raw)) > 2,
+            "distinct_raw=%d blank=%s" % (len(set(mixed_raw)), decoded.get("blank")),
+        )
+        near_uniform = bytearray(_blank_pixels(bpp=3, value=0x20))
+        near_uniform[:28] = b"\x21" * 28
+        decoded = decode_png(_encode_png(bytes(near_uniform), 24, 3, 1))
+        check(
+            "near-uniform pixels with the Sub filter stay blank",
+            decoded.get("status") == "ok" and decoded.get("blank") is True,
+            decoded.get("detail"),
+        )
+        checkerboard = bytes(
+            0xFF if ((pixel % 24) + (pixel // 24)) % 2 == 0 else 0x00
+            for pixel in range(24 * 24)
+            for _ in range(3)
+        )
+        decoded = decode_png(_encode_png(checkerboard, 24, 3, 4))
+        check(
+            "two-value checkerboard with the Paeth filter is not blank",
+            decoded.get("status") == "ok" and decoded.get("blank") is False,
+            decoded.get("detail"),
+        )
+
+        # 21. Fail-closed format handling: legal-but-unsupported PNGs are
+        #     unverifiable (never non-blank, never PASS); malformed data is
+        #     invalid (contradiction).
+        unsupported_cases = [
+            ("16-bit RGB", _encode_png(_pixels(201), 24, 3, 0, bit_depth=16)),
+            ("grayscale 8-bit", _encode_png(_pixels(202), 24, 1, 0, color_type=0)),
+            ("palette 8-bit", _encode_png(_pixels(203), 24, 1, 0, color_type=3)),
+            ("interlaced RGBA", _encode_png(_pixels(204, bpp=4), 24, 4, 0, interlace=1)),
+        ]
+        for label, data in unsupported_cases:
+            decoded = decode_png(data)
+            check(
+                "unsupported PNG format (%s) is unverifiable, never non-blank/PASS"
+                % label,
+                decoded.get("status") == "unsupported",
+                decoded.get("detail"),
+            )
+        valid_rgb = _encode_png(_pixels(205), 24, 3, 0)
+        invalid_cases = [
+            ("illegal bit depth 3 for RGB",
+             _encode_png(_pixels(206), 24, 3, 0, bit_depth=3)),
+            ("illegal color type 7",
+             _encode_png(_pixels(207), 24, 3, 0, color_type=7)),
+            ("illegal compression method 1",
+             _encode_png(_pixels(208), 24, 3, 0, compression=1)),
+            ("illegal filter method 1",
+             _encode_png(_pixels(209), 24, 3, 0, filter_method=1)),
+            ("illegal interlace method 2",
+             _encode_png(_pixels(210), 24, 3, 0, interlace=2)),
+            ("zero width",
+             _encode_png(b"", 0, 3, 0)),
+            ("invalid filter byte 5",
+             _encode_png(_pixels(211), 24, 3, 0,
+                         raw_override=(b"\x05" + bytes(24 * 3)) * 24)),
+            ("truncated scanline payload",
+             _encode_png(_pixels(212), 24, 3, 0,
+                         raw_override=_forward_filtered_rows(_pixels(212), 24, 3, 0)[:-1])),
+            ("excess scanline payload",
+             _encode_png(_pixels(213), 24, 3, 0,
+                         raw_override=_forward_filtered_rows(_pixels(213), 24, 3, 0) + b"\x00")),
+            ("broken zlib stream",
+             _encode_png(_pixels(214), 24, 3, 0, idat_override=b"not-a-zlib-stream")),
+            ("truncated chunk (missing CRC)", valid_rgb[:-4]),
+        ]
+        for label, data in invalid_cases:
+            decoded = decode_png(data)
+            check(
+                "invalid PNG (%s) is rejected as invalid" % label,
+                decoded.get("status") == "invalid",
+                decoded.get("detail"),
+            )
+
+        # 22. Verdict integration: unsupported captures leave the case
+        #     unverifiable (non-PASS, non-zero exit), invalid captures are a
+        #     contradiction, and a blank image with mixed filters is still a
+        #     contradiction end to end.
+        unsupported_png = _encode_png(_pixels(220), 24, 3, 0, bit_depth=16)
+        report = evaluate(
+            fixture(
+                "png-unsupported",
+                capture_plan={
+                    "static": [_RawPng(unsupported_png), _RawPng(unsupported_png)],
+                    "dynamic": [_pixels(2), _pixels(3)],
+                    "canvas": [_pixels(4), _pixels(5)],
+                    "long": [_pixels(6), _pixels(7), _pixels(8)],
+                },
+            )
+        )
+        check(
+            "unsupported PNG format makes capture integrity non-PASS (unverifiable)",
+            _status(report, "capture-static-integrity") == "NOT-EVALUATED"
+            and evidence_exit_code(report) != 0,
+            _status(report, "capture-static-integrity"),
+        )
+        invalid_png = _encode_png(
+            _pixels(221), 24, 3, 0,
+            raw_override=(b"\x05" + bytes(24 * 3)) * 24,
+        )
+        report = evaluate(
+            fixture(
+                "png-invalid",
+                capture_plan={
+                    "static": [_RawPng(invalid_png), _RawPng(invalid_png)],
+                    "dynamic": [_pixels(2), _pixels(3)],
+                    "canvas": [_pixels(4), _pixels(5)],
+                    "long": [_pixels(6), _pixels(7), _pixels(8)],
+                },
+            )
+        )
+        check(
+            "invalid PNG makes capture integrity a CONTRADICTION",
+            _status(report, "capture-static-integrity") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            _status(report, "capture-static-integrity"),
+        )
+        report = evaluate(
+            fixture(
+                "blank-mixed-filters",
+                capture_plan={
+                    "static": [
+                        _RawPng(_png_bytes(_blank_pixels(), filters=mixed_filters)),
+                        _RawPng(_png_bytes(_blank_pixels(), filters=(4, 3, 2, 1, 0))),
+                    ],
+                    "dynamic": [_pixels(2), _pixels(3)],
+                    "canvas": [_pixels(4), _pixels(5)],
+                    "long": [_pixels(6), _pixels(7), _pixels(8)],
+                },
+            )
+        )
+        check(
+            "blank capture with mixed filters is still a CONTRADICTION",
+            _status(report, "capture-static-integrity") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            _status(report, "capture-static-integrity"),
+        )
+
+        # 23. Chunk CRC (§5.5) and IDAT continuity (§5.6 / §11.2.3): corrupted
+        #     chunk bytes must fail closed even when the zlib stream still
+        #     decodes, and multiple IDAT chunks must be adjacent.
+        base_pixels = _pixels(230)
+        crc_cases = [
+            ("IHDR", _encode_png(base_pixels, 24, 3, 0, bad_crc_tags=(b"IHDR",))),
+            ("IDAT", _encode_png(base_pixels, 24, 3, 0, bad_crc_tags=(b"IDAT",))),
+            ("IDAT (split stream)", _encode_png(base_pixels, 24, 3, 0,
+                                                idat_chunks=2,
+                                                bad_crc_tags=(b"IDAT",))),
+            ("IEND", _encode_png(base_pixels, 24, 3, 0, bad_crc_tags=(b"IEND",))),
+            ("ancillary tEXt", _encode_png(base_pixels, 24, 3, 0,
+                                           ancillary_pre=((b"tEXt", b"Comment\x00x"),),
+                                           bad_crc_tags=(b"tEXt",))),
+        ]
+        for label, data in crc_cases:
+            decoded = decode_png(data)
+            check(
+                "CRC mismatch (%s) is invalid" % label,
+                decoded.get("status") == "invalid"
+                and "CRC mismatch" in (decoded.get("detail") or ""),
+                decoded.get("detail"),
+            )
+        split_valid = _encode_png(base_pixels, 24, 3, 0, idat_chunks=2)
+        decoded = decode_png(_flip_last_chunk_crc(split_valid, b"IDAT"))
+        check(
+            "CRC mismatch (second IDAT of a split stream) is invalid",
+            decoded.get("status") == "invalid"
+            and "CRC mismatch" in (decoded.get("detail") or ""),
+            decoded.get("detail"),
+        )
+
+        uniform = _blank_pixels()
+        decoded = decode_png(
+            _encode_png(uniform, 24, 3, tuple(range(5)), idat_chunks=3)
+        )
+        check(
+            "adjacent IDAT chunks decode as one stream (uniform stays blank)",
+            decoded.get("status") == "ok"
+            and decoded.get("blank") is True
+            and decoded.get("pixels") == uniform,
+            decoded.get("detail"),
+        )
+        decoded = decode_png(_encode_png(base_pixels, 24, 3, 2, idat_chunks=3))
+        check(
+            "adjacent IDAT chunks decode as one stream (non-uniform stays non-blank)",
+            decoded.get("status") == "ok"
+            and decoded.get("blank") is False
+            and decoded.get("pixels") == base_pixels,
+            decoded.get("detail"),
+        )
+        decoded = decode_png(
+            _encode_png(base_pixels, 24, 3, 0, idat_chunks=2,
+                        ancillary_mid=((b"tEXt", b"Comment\x00between"),))
+        )
+        check(
+            "ancillary chunk between IDAT chunks is invalid",
+            decoded.get("status") == "invalid"
+            and "non-consecutive IDAT" in (decoded.get("detail") or ""),
+            decoded.get("detail"),
+        )
+        decoded = decode_png(
+            _encode_png(base_pixels, 24, 3, 2,
+                        ancillary_pre=((b"tEXt", b"Comment\x00pre"),),
+                        ancillary_post=((b"tEXt", b"Comment\x00post"),))
+        )
+        check(
+            "ancillary chunks before/after IDAT decode normally (non-uniform)",
+            decoded.get("status") == "ok"
+            and decoded.get("blank") is False
+            and decoded.get("pixels") == base_pixels,
+            decoded.get("detail"),
+        )
+        decoded = decode_png(
+            _encode_png(uniform, 24, 3, 4,
+                        ancillary_pre=((b"tEXt", b"Comment\x00pre"),),
+                        ancillary_post=((b"tEXt", b"Comment\x00post"),))
+        )
+        check(
+            "ancillary chunks before/after IDAT decode normally (uniform blank)",
+            decoded.get("status") == "ok"
+            and decoded.get("blank") is True
+            and decoded.get("pixels") == uniform,
+            decoded.get("detail"),
+        )
+
+        bad_idat_crc = _encode_png(_pixels(231), 24, 3, 0, bad_crc_tags=(b"IDAT",))
+        report = evaluate(
+            fixture(
+                "png-bad-chunk-crc",
+                capture_plan={
+                    "static": [_RawPng(bad_idat_crc), _RawPng(bad_idat_crc)],
+                    "dynamic": [_pixels(2), _pixels(3)],
+                    "canvas": [_pixels(4), _pixels(5)],
+                    "long": [_pixels(6), _pixels(7), _pixels(8)],
+                },
+            )
+        )
+        check(
+            "corrupted IDAT CRC makes capture integrity a CONTRADICTION",
+            _status(report, "capture-static-integrity") == "CONTRADICTION"
+            and evidence_exit_code(report) == 1,
+            _status(report, "capture-static-integrity"),
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -1,0 +1,235 @@
+diff --git a/chrome/browser/browser_cli/foreground_assist.cc b/chrome/browser/browser_cli/foreground_assist.cc
+index b12b0e1f03..47b4ea68f5 100644
+--- a/chrome/browser/browser_cli/foreground_assist.cc
++++ b/chrome/browser/browser_cli/foreground_assist.cc
+@@ -91,6 +91,23 @@ bool HasForegroundAssistIntent(const base::CommandLine& command_line) {
+          command_line.HasSwitch(kBrowserCliForegroundAssistReleaseSwitch);
+ }
+ 
++BrowserCliCommandLineIntent ArbitrateBrowserCliCommandLineIntent(
++    const base::CommandLine& command_line) {
++  // An assist request/release intent wins unconditionally: a command line that
++  // also carries the user-explicit show switch is denied by the assist
++  // classifier (kBlockedByConflictingSwitches) and consumed by the assist
++  // producer, so the show producer and its presentation gateway are never
++  // reached and the conflicting request can never fall back to ordinary launch
++  // processing either.
++  if (HasForegroundAssistIntent(command_line)) {
++    return BrowserCliCommandLineIntent::kForegroundAssist;
++  }
++  if (command_line.HasSwitch(kBrowserCliUserExplicitShowSwitch)) {
++    return BrowserCliCommandLineIntent::kUserExplicitShow;
++  }
++  return BrowserCliCommandLineIntent::kOrdinary;
++}
++
+ base::CommandLine CommandLineForColdStartStartup(
+     const base::CommandLine& command_line) {
+   if (!HasForegroundAssistIntent(command_line)) {
+diff --git a/chrome/browser/browser_cli/foreground_assist.h b/chrome/browser/browser_cli/foreground_assist.h
+index 787460ae79..dfeb578403 100644
+--- a/chrome/browser/browser_cli/foreground_assist.h
++++ b/chrome/browser/browser_cli/foreground_assist.h
+@@ -82,6 +82,31 @@ bool ForegroundAssistRequestClassConsumesCommandLine(
+ // with only the auxiliary assist switches is kNotRequested and has no intent.
+ bool HasForegroundAssistIntent(const base::CommandLine& command_line);
+ 
++// Which Browser CLI command-line producer owns |command_line|. Both production
++// entry points (the cold start and the forwarded ProcessSingleton
++// notification) must route through this single arbitration, so one command
++// line can never be consumed by the wrong producer:
++//   * kForegroundAssist: the command line carries an assist request or release
++//     intent. The assist producer handles it even when the command line also
++//     carries the user-explicit show switch; that conflicting combination is
++//     classified kBlockedByConflictingSwitches, denied and logged, and
++//     consumed so it can never reach the USER_EXPLICIT show producer or its
++//     presentation gateway.
++//   * kUserExplicitShow: no assist intent, but the explicit show switch is
++//     present. The show producer handles it (and still falls back to ordinary
++//     processing when the command line carries launch arguments).
++//   * kOrdinary: neither intent; stock command-line processing.
++enum class BrowserCliCommandLineIntent {
++  kOrdinary,
++  kForegroundAssist,
++  kUserExplicitShow,
++};
++
++// Pure and deterministic. An assist intent always wins over the show switch;
++// this function is the only place that decides the handler order.
++BrowserCliCommandLineIntent ArbitrateBrowserCliCommandLineIntent(
++    const base::CommandLine& command_line);
++
+ // The command line the cold-start startup (`StartupBrowserCreator::Start`) must
+ // use:
+ //   * without an assist intent: an unchanged copy of |command_line|;
+diff --git a/chrome/browser/browser_cli/foreground_assist_unittest.cc b/chrome/browser/browser_cli/foreground_assist_unittest.cc
+index bb77ba6a60..779317c37f 100644
+--- a/chrome/browser/browser_cli/foreground_assist_unittest.cc
++++ b/chrome/browser/browser_cli/foreground_assist_unittest.cc
+@@ -309,5 +309,72 @@ TEST(ForegroundAssistRequestTest, SupportingSwitchesKeepRequest) {
+             ForegroundAssistRequestClass::kRequestLease);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Command-line intent arbitration (patch 013). The assist producer always wins
++// over the explicit show switch, so a conflicting command line is denied by
++// the assist classifier (kBlockedByConflictingSwitches) and consumed: the show
++// producer and its presentation gateway are never reached.
++// ---------------------------------------------------------------------------
++
++TEST(BrowserCliCommandLineIntentTest, AssistRequestWinsOverShowSwitch) {
++  base::CommandLine command_line = RequestCommandLine();
++  command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(command_line),
++            BrowserCliCommandLineIntent::kForegroundAssist);
++}
++
++TEST(BrowserCliCommandLineIntentTest, AssistReleaseWinsOverShowSwitch) {
++  base::CommandLine command_line = ReleaseCommandLine();
++  command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(command_line),
++            BrowserCliCommandLineIntent::kForegroundAssist);
++}
++
++TEST(BrowserCliCommandLineIntentTest, AssistRequestAloneIsAssist) {
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(RequestCommandLine()),
++            BrowserCliCommandLineIntent::kForegroundAssist);
++}
++
++TEST(BrowserCliCommandLineIntentTest, AssistReleaseAloneIsAssist) {
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(ReleaseCommandLine()),
++            BrowserCliCommandLineIntent::kForegroundAssist);
++}
++
++TEST(BrowserCliCommandLineIntentTest, ShowAloneIsShow) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(command_line),
++            BrowserCliCommandLineIntent::kUserExplicitShow);
++}
++
++TEST(BrowserCliCommandLineIntentTest, OrdinaryCommandLineIsOrdinary) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendArg("https://example.com/");
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(command_line),
++            BrowserCliCommandLineIntent::kOrdinary);
++}
++
++TEST(BrowserCliCommandLineIntentTest,
++     AuxiliaryAssistSwitchesAloneHaveNoIntent) {
++  base::CommandLine command_line(base::CommandLine::NO_PROGRAM);
++  command_line.AppendSwitchASCII(kBrowserCliForegroundAssistReasonSwitch,
++                                 "login");
++  command_line.AppendSwitchASCII(kBrowserCliForegroundAssistWindowSwitch,
++                                 "42");
++  EXPECT_EQ(ArbitrateBrowserCliCommandLineIntent(command_line),
++            BrowserCliCommandLineIntent::kOrdinary);
++}
++
++TEST(BrowserCliCommandLineIntentTest,
++     ConflictingShowAndAssistIsDeniedAndConsumed) {
++  base::CommandLine command_line = RequestCommandLine();
++  command_line.AppendSwitch(kBrowserCliUserExplicitShowSwitch);
++  ForegroundAssistRequest request;
++  EXPECT_EQ(ClassifyForegroundAssistRequest(command_line, &request),
++            ForegroundAssistRequestClass::kBlockedByConflictingSwitches);
++  EXPECT_TRUE(ForegroundAssistRequestClassConsumesCommandLine(
++      ForegroundAssistRequestClass::kBlockedByConflictingSwitches));
++}
++
+ }  // namespace
+ }  // namespace browser_cli
+diff --git a/chrome/browser/chrome_browser_main.cc b/chrome/browser/chrome_browser_main.cc
+index d2cf93aab7..cedff2ac31 100644
+--- a/chrome/browser/chrome_browser_main.cc
++++ b/chrome/browser/chrome_browser_main.cc
+@@ -560,22 +560,28 @@ void ProcessSingletonNotificationCallbackImpl(
+ #endif
+ 
+ #if BUILDFLAG(IS_MAC)
+-  // Browser CLI: a direct binary invocation carrying the explicit `show`
+-  // switch is handled by the shared producer instead of ordinary command-line
+-  // processing, so an existing window is presented and no duplicate window is
+-  // created. Every other command line falls through to stock handling.
+-  if (browser_cli::HandleUserExplicitShowRequest(command_line,
+-                                                 current_directory)) {
+-    return;
+-  }
+-
+-  // Browser CLI: an agent foreground-assist request or release from a direct
+-  // invocation is consumed by the assist producer (validated and fail-closed),
+-  // including command lines that also carry launch arguments: an assist
+-  // invocation must never act as an ordinary URL / app launch that could change
+-  // a HUMAN-owned window or create a visible window.
+-  if (browser_cli::HandleForegroundAssistRequest(command_line)) {
+-    return;
++  // Browser CLI: exactly one producer may consume a direct invocation. The
++  // shared arbitration gives any assist request/release intent priority over
++  // the explicit `show` switch, so a conflicting command line is denied and
++  // logged by the assist producer (conflicting-producer-switches) and never
++  // reaches the USER_EXPLICIT show producer or its presentation gateway. A
++  // pure show request keeps the existing presentation path, and a command line
++  // without either intent falls through to stock handling.
++  switch (browser_cli::ArbitrateBrowserCliCommandLineIntent(command_line)) {
++    case browser_cli::BrowserCliCommandLineIntent::kForegroundAssist:
++      // An assist intent is always consumed (fail closed): it must never act
++      // as an ordinary URL / app launch that could change a HUMAN-owned window
++      // or create a visible window.
++      browser_cli::HandleForegroundAssistRequest(command_line);
++      return;
++    case browser_cli::BrowserCliCommandLineIntent::kUserExplicitShow:
++      if (browser_cli::HandleUserExplicitShowRequest(command_line,
++                                                     current_directory)) {
++        return;
++      }
++      break;
++    case browser_cli::BrowserCliCommandLineIntent::kOrdinary:
++      break;
+   }
+ #endif
+ 
+@@ -2161,21 +2167,29 @@ int ChromeBrowserMainParts::PreMainMessageLoopRunImpl() {
+   if (browser_creator_->Start(launch_command_line, base::FilePath(),
+                               profile_info, last_opened_profiles)) {
+ #if BUILDFLAG(IS_MAC)
+-    // Browser CLI: a cold start carrying the explicit `show` switch presents
+-    // exactly one window. The startup path has already created its window (its
+-    // native show was denied by the background policy); with
+-    // --no-startup-window no window exists yet and the producer creates one for
+-    // the resolved profile. Ordinary background starts never reach this call.
+-    browser_cli::HandleUserExplicitShowRequest(
+-        *base::CommandLine::ForCurrentProcess(), base::FilePath());
+-    // Browser CLI: the agent foreground-assist producer shares the same two
+-    // entry points as the explicit show producer; it is inert unless the
+-    // assist switches are present and valid. The startup above ran with the
+-    // sanitized command line, so an assist invocation reaching this point has
+-    // no window to target and is denied/logged; on the ProcessSingleton path
+-    // the returned consume flag prevents ordinary launch processing.
+-    browser_cli::HandleForegroundAssistRequest(
+-        *base::CommandLine::ForCurrentProcess());
++    // Browser CLI: the same single arbitration as the ProcessSingleton path.
++    // An assist intent (including a command line that also carries the
++    // explicit show switch) is denied/logged and consumed by the assist
++    // producer, so it can never present a window through the USER_EXPLICIT
++    // path; the startup above ran with the sanitized command line (no URL /
++    // app side effects, no startup window), so the denied request cannot fall
++    // back to an ordinary launch either. A pure show request still presents
++    // exactly one window: the startup path has already created its window
++    // (its native show was denied by the background policy), and with
++    // --no-startup-window the producer creates one for the resolved profile.
++    switch (browser_cli::ArbitrateBrowserCliCommandLineIntent(
++        *base::CommandLine::ForCurrentProcess())) {
++      case browser_cli::BrowserCliCommandLineIntent::kForegroundAssist:
++        browser_cli::HandleForegroundAssistRequest(
++            *base::CommandLine::ForCurrentProcess());
++        break;
++      case browser_cli::BrowserCliCommandLineIntent::kUserExplicitShow:
++        browser_cli::HandleUserExplicitShowRequest(
++            *base::CommandLine::ForCurrentProcess(), base::FilePath());
++        break;
++      case browser_cli::BrowserCliCommandLineIntent::kOrdinary:
++        break;
++    }
+ #endif
+ 
+ #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)

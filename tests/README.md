@@ -10,7 +10,7 @@
 tests/run-script-tests.sh     # 0 = 全部通过；1 = 有失败
 ```
 
-覆盖内容（194 项）：
+覆盖内容（基线离线复跑：2026-09-23 21:25 CST，`223 passed / 0 failed`，含第 28 组 6 项；本次新增第 29 组 4 项与第 26 组 PNG filter/chunk 反例断言 2 项，本机有真实 checkout 时预期 `229 passed / 0 failed`。无 checkout 时第 28/29 组各有 1 项 `--checkout` 检查转为 `SKIP`（不计 PASS），实际 PASS 数以复跑为准。仅语法、help/dry-run、临时 fixture 与只读静态检查，不启动 Browser CLI、不构建、不操作可见窗口）：
 
 | 组 | 内容 |
 | --- | --- |
@@ -40,7 +40,19 @@ tests/run-script-tests.sh     # 0 = 全部通过；1 = 有失败
 | 24 | **CLI 显式 `show` producer 确定性静态 fixture（不启动浏览器）**：合成 `BROWSER_CLI_PRESENTATION` + `BROWSER_CLI_USER_EXPLICIT_SHOW` 日志、watcher 采样与 sink JSONL 喂给 `human-ownership-collect.py`；handled(existing/created)+denied 全部 PASS 且 rc=0、report.md 逐条记录 outcome、failed producer 与 handled-but-missing-policy-allow 判 CONTRADICTION（rc=1）、日志无 producer 证据时三个 CLI-show 检查必须 NOT-EVALUATED（rc=0，绝不伪通过） |
 | 25 | **Foreground Assist 人工验收包（静态 + fixture，不启动浏览器）**：driver `bash -n`、collector/page-server Python 语法、`--help`、无 eval/open/osascript/签名/钥匙串调用；Developer ID preflight（`TeamIdentifier` + `codesign -dv` + 拒绝 `Signature=adhoc`）与缺失 App 负例 fail closed；`prepare --dry-run` **零写入**且 runbook 含 `--use-mock-keychain`/mktemp profile/assist request+release 开关/reason+window 参数/每用例证据词汇（grant、visible、background、timeout、user-takeover、launch-arguments-not-agent-assist）与 ABORT fail-closed 步骤；确定性 fixture：全用例 PASS + hand-back **BLOCKED**（rc=0）、未授权窗口 visible CONTRADICTION（rc=1）、用户接管后 background CONTRADICTION（rc=1）、无证据全 NOT-EVALUATED + BLOCKED（rc=0）、ABORT 标记 `session-aborted-by-user` CONTRADICTION（rc=1）；**patch 005 无回落导航合同**：`name=blocked_cold` / `name=blocked_session` 任一 page-server GET 判 `assist-blocked-url-never-navigates` CONTRADICTION（rc=1），缺 page-server 日志/目标页证据/watcher 采样时该检查 NOT-EVALUATED（rc=0，绝不假 PASS）；report.md 含 producer/policy/real-page 证据分区与 BLOCKED 矩阵；driver `windows` 列出窗口 id、driver `collect` 在合成证据目录生成 report.json/report.md |
 
-| 26 | **Gate C 后台截图计划 + 证据 fixture（静态，不启动浏览器）**：driver `bash -n`/`--help`、默认 dry-run 计划包含 Developer ID 预检、`--use-mock-keychain`、`mktemp` profile、`--browser-cli-background-presentation`、`cdp_pipe_lib`、app-identity watcher、PNG/sha256 证据契约、视频 NOT-EVALUATED；`--run` 被显式拒绝（本切片无执行模式）；driver 无 open/osascript/screencapture/pkill/killall/codesign/ninja 且绝不执行 app 二进制；checker 无启动字面量（证据输入只读、仅写 capture-report.json/md，hygiene 干净）；checker `--self-test` 28 项 fixture 负例：窗口上屏、空白/空文件 PNG、跨用例重复像素、静态截图不一致、动态全部相同、清单哈希篡改、会话契约缺失均判 CONTRADICTION，缺证据判 NOT-EVALUATED；最少截图数强制（static/dynamic/canvas≥2、long≥3，不足即 CONTRADICTION）；**固定必选矩阵由 checker 代码定义**（static/dynamic/canvas/long-scroll，删减/改名/optional 化即 CONTRADICTION，仅 video 可 optional）；**watcher 以原始 sample 最大值与 final.max 的上界为准**，两者不一致即 CONTRADICTION（final.max=0 不得遮蔽 count>0 的上屏样本）；退出码语义：仅当所有必选检查 PASS（视频 optional 可 NOT-EVALUATED）才为 0，证据不足 rc=3（INSUFFICIENT-EVIDENCE），矛盾 rc=1；空证据目录经 driver `check` 返回非零，`--write-fixture` 生成的完整必选证据返回 0 |
+| 26 | **Gate C 后台截图计划 + 证据 fixture（静态，不启动浏览器）**：driver `bash -n`/`--help`、默认 dry-run 计划包含 Developer ID 预检、`--use-mock-keychain`、`mktemp` profile、`--browser-cli-background-presentation`、`cdp_pipe_lib`、app-identity watcher、PNG/sha256 证据契约、视频 NOT-EVALUATED；`--run` 被显式拒绝（本切片无执行模式）；driver 无 open/osascript/screencapture/pkill/killall/codesign/ninja 且绝不执行 app 二进制；checker 无启动字面量（证据输入只读、仅写 capture-report.json/md，hygiene 干净）；checker `--self-test` **102 项** fixture 负例：窗口上屏、空白/空文件 PNG、跨用例重复像素、静态截图不一致、动态全部相同、清单哈希篡改、会话契约缺失均判 CONTRADICTION，缺证据判 NOT-EVALUATED；**PNG blank 检测先按 W3C PNG §9 逆变换 scanline filter 0..4、只对重建像素做 uniform heuristic**（filter byte 不算像素；fixture 由独立 forward-filter encoder 生成并以 W3C 公式 KAT 锁定，`raw 字节 >2 种但图像 uniform` 的陷阱必须仍判 blank）；非法 IHDR/filter byte/scanline 截断/多余/坏 zlib、**chunk CRC 损坏（IHDR/IDAT/IEND/ancillary）**、**IDAT 不连续（ancillary 夹在两个 IDAT 之间）** 判 invalid → CONTRADICTION（相邻多个 IDAT 合并解码、ancillary 在 IDAT 前/后正常处理），合法但未支持的格式（16-bit/灰度/调色板/interlace）判 unsupported → capture integrity NOT-EVALUATED（unverifiable，非 PASS）；最少截图数强制（static/dynamic/canvas≥2、long≥3，不足即 CONTRADICTION）；**固定必选矩阵由 checker 代码定义**（static/dynamic/canvas/long-scroll，删减/改名/optional 化即 CONTRADICTION，仅 video 可 optional）；**09:03 UTC watcher 证据契约**：至少 1 条可解析原始 `sample ts= count=` 且**恰好 1 条完整** `final max= nonzero_samples=`，时间戳必须可解析且严格递增——缺原始样本（final-only 绝不可 PASS）或缺 final 判 NOT-EVALUATED 且 rc=3；畸形/缺字段/重复 final/负数/时间戳不递增/最大值或非零计数与原始样本不一致判 CONTRADICTION rc=1；只有真实原始样本 max=0 + 完整一致 final 才 PASS（final.max=0 不得遮蔽 count>0 的上屏样本）；退出码语义：仅当所有必选检查 PASS（视频 optional 可 NOT-EVALUATED）才为 0，证据不足 rc=3（INSUFFICIENT-EVIDENCE），矛盾 rc=1；空证据目录经 driver `check` 返回非零，`--write-fixture` 生成的完整必选证据返回 0 |
+| 27 | **Gate F 多窗口并行离线 harness（静态，不启动浏览器；无运行时执行器）**：driver `bash -n`/`--help`、默认 dry-run 打印未来 runtime 契约与证据契约（Developer ID 预检、`--use-mock-keychain`、`mktemp` profile、`--browser-cli-background-presentation`、app-identity watcher、≥3 个不同真实 HTTPS 站点、每窗口独立 active tab、Cookie/session 语义、HUMAN/ASSIST 互不影响、证据契约、**截图仅列 Gate C 依赖（BLOCKED，不宣称通过）**）；**静态源码断言**：driver 拒绝执行 flag 且无 app 启动接线（无 run helper 引用/`RUN_TOOL`/`RUN_FLAG`/`APP_OVERRIDE`），`parallel-window-cdp-check.py` 离线化（无 `cdp_pipe_lib`/`launch_app`/`run_session`/`subprocess`/`xcrun`，只暴露 `--self-test`/`--write-run-fixture`）；driver 无 open/osascript/screencapture/pkill/killall/codesign/ninja 且绝不执行 app 二进制；离线 checker 无启动字面量；checker `--self-test` fixture 负例（<3 窗口、w2 标 optional、重复窗口名/URL/active tab、非 https、watcher final-only、sample>0、cookie 模式冲突 → CONTRADICTION；缺证据 → NOT-EVALUATED；退出码 0/1/3）；helper `--self-test` 覆盖离线 subset/overall 分离与严格 watcher 规则；空证据目录经 driver `check` 返回非零、完整固定矩阵返回 0；**套件不再以执行 flag 调用任何脚本** |
+| 28 | **origin-wiring 静态接线 checker 纳入统一 suite（只读，不启动浏览器）**：`user-menu-origin-wiring-check.py`（patch 010/012）、`omnibox-everywhere-origin-check.py`（patch 011）的 Python 语法（`ast.parse`）、`--self-test`（离线 fixture，要求 rc=0 **且** `SELFTEST SUMMARY: N passed, 0 failed`）、真实 Chromium checkout `--checkout "$TEST_CHROMIUM_SRC"`（复用 suite 既有 checkout 路径变量：`CHROMIUM_SRC`/`CHROMIUM_ROOT` 或默认 `~/dev/chromium/src`，不硬编码个人路径；要求 rc=0 **且** `USER-MENU-ORIGIN-WIRING: OK (N checks, 0 failed)` / `OMNIBOX-EVERYWHERE-ORIGIN: OK (N checks, 0 failed)`）；无 checkout 时打印 `SKIP`（不计 PASS）；失败时打印 checker 完整输出前 20 行 |
+| 29 | **命令行意图仲裁静态 checker（patch 013，只读，不启动浏览器）**：`command-line-intent-arbitration-check.py` 的 Python 语法（`ast.parse`）、`--self-test`（离线 fixture，要求 rc=0 **且** `SELFTEST SUMMARY: N passed, 0 failed`）、真实 Chromium checkout `--checkout "$TEST_CHROMIUM_SRC"`（要求 rc=0 **且** `COMMAND-LINE-INTENT-ARBITRATION: OK (N checks, 0 failed)`；无 checkout 时 `SKIP` 不计 PASS）。checker 只读 `chrome/browser/chrome_browser_main.cc`：两个生产入口必须调用同一 `ArbitrateBrowserCliCommandLineIntent`，assist case 必须排在 show case 之前且各自调用对应 handler，两个 handler 只允许出现在仲裁 switch 内；fixture 反例强制失败：show-first 旧顺序、仅单入口仲裁、show 在仲裁前调用、case 互换、assist case 缺 handler |
+
+第 28 组把两个关键静态接线 checker 纳入统一回归（此前只在各自任务里手工运行）：checker 自身只读源码、
+不启动浏览器、不 build、不签名；suite 只以 `--checkout` 传入既有 checkout 路径变量。失败判据是
+**rc=0 与精确的 `0 failed` 汇总行同时成立**，避免把含 “fail” 字样的通过明细误判；失败时逐行显示原始输出。
+
+第 29 组守住 patch 013 的 P0 修复：命令行同时携带 USER_EXPLICIT `show` 与 assist request/release 时，
+共享仲裁必须判为 assist intent，assist case 先行消费（`denied/conflicting-producer-switches`），
+show producer 与 presentation gateway 永不触达；fixture 里的 show-first 旧顺序（本次修复的缺陷形态）
+必须判 FAIL，防止回归。
 
 新增脚本或安全门禁时，请在此套件中补充对应负例。
 
@@ -504,7 +516,7 @@ harness。**本切片没有执行模式**：不启动浏览器、不显示/激�
 ```sh
 tests/phase5-background-capture.sh                        # 默认 dry-run：打印执行计划与证据契约
 tests/phase5-background-capture.sh check --evidence DIR   # 校验未来会话证据（证据输入只读；checker 仅写出 capture-report.json/md）
-python3 tests/tools/capture-evidence-check.py --self-test # fixture 负例（16 项）
+python3 tests/tools/capture-evidence-check.py --self-test # fixture 负例（102 项，含 PNG filter 0..4 KAT 与 chunk CRC/IDAT 连续性）
 ```
 
 设计要点：
@@ -529,6 +541,18 @@ python3 tests/tools/capture-evidence-check.py --self-test # fixture 负例（16 
    **watcher sample 最大值与 final.max 不一致**（raw samples 为准，final.max=0 不得遮蔽上屏）、
    任何 presentation allow 或 AppKit allow、会话契约（签名 + mock keychain + managed）不成立；
    缺证据一律 NOT-EVALUATED。
+   **PNG 有效性（blank 检测）**：先校验 IHDR（合法 color type/bit depth/compression/filter/
+   interlace）、IHDR/IDAT/IEND chunk 结构、**每个 chunk 的 CRC（覆盖 chunk type+data，§5.5）**
+   与 zlib 流，再按 **W3C PNG Third Edition §9** 逐 scanline 逆变换 filter 0..4（Sub/Up/
+   Average/Paeth，bpp 按通道、模 256），最后在**重建后的像素字节**上做 uniform heuristic——
+   filter byte 绝不算作像素；scanline payload 必须精确等于 `height*(1+width*channels)`，
+   截断/多余、filter byte 不在 0..4、非法 IHDR 字段、坏 zlib、**任一 chunk CRC 不匹配、
+   多个 IDAT 之间夹入 ancillary（§5.6/§11.2.3）** 一律 **invalid → CONTRADICTION**（chunk 数据
+   被改坏但 zlib/scanline 仍可解码时也必须 fail closed）；多个相邻 IDAT 合并为一个 zlib 流、
+   ancillary 在 IDAT 前/后仍正常处理；**合法但不在已核实截图子集内的 PNG（非 8-bit RGB/RGBA、
+   interlaced、超大）一律 unsupported → capture integrity NOT-EVALUATED（unverifiable），
+   绝不猜测为非 blank，也绝不 PASS**。Chromium `Page.captureScreenshot` 的 PNG 由
+   `SkPngRustEncoder` 生成（`Filter::Up` 或 `Filter::Adaptive` 0..4），因此必须支持全部五类 filter。
    **退出码**：仅当所有必选检查 PASS（视频 optional 可为 NOT-EVALUATED）才返回 0；存在矛盾返回 1；
    证据不足返回 3（INSUFFICIENT-EVIDENCE）。checker 以只读方式读取证据，仅写出 `capture-report.json/md`。
 5. **静态门禁**：`tests/run-script-tests.sh` 第 26 组与 `tests/check-browser-launch-hygiene.sh`
@@ -540,9 +564,73 @@ python3 tests/tools/capture-evidence-check.py --self-test # fixture 负例（16 
 2026-09-23 13:35 CST 第 2 次审查发现两处假通过（必选清单取自证据自带 plan、final.max 遮蔽
 sample 上屏），已改为**代码内固定必选矩阵**与 **sample/final 上界一致性判定**并新增对应负例——
 **第 2 次返工**；
+2026-09-23（本轮定向任务）主负责人定位 **blank 检测根因**：原实现只对 zlib 解压后的 IDAT 流做
+字节频率统计，把每行 scanline 的 filter byte 与过滤后的字节当成像素（fixture 只造 filter=0，
+无法证伪该错误）。已实现标准子集 PNG 解码：IHDR 合法性 + filter 0..4 逆变换 + 精确 scanline
+payload/截断/多余/非法 filter 的 fail-closed 判定 + 未支持格式 unverifiable；fixture 改由
+**独立 forward-filter encoder** 生成（含 W3C 公式 KAT、uniform/non-uniform × 5 filter × RGB/RGBA、
+raw 字节陷阱与 unsupported/invalid 负例），self-test **90/90**——**Gate C 判定器第 3 次修正**；
+2026-09-23 主负责人定向复核发现两个 PNG 结构缺口（chunk CRC 从未读取比对；IDAT 连续性未检查），
+已最小修正：每个 chunk 校验 CRC（覆盖 chunk type+data，§5.5）、IDAT 必须连续（§5.6/§11.2.3），
+新增 IHDR/IDAT/IEND/ancillary CRC 损坏、split IDAT 合并、ancillary 夹在 IDAT 之间等正/反例，
+self-test **102/102**——**本子项第 1 次复核修正（REWORK 1）**；
 **runtime 仍缺**：签名 App 的隔离会话执行器（CDP pipe 截图 + 素材页 + watcher 接线）、
 真实 PNG/时间序列证据与 `capture-report.md` 的 PASS 判定；视频素材（确定性本地）未构建，
 固定 NOT-EVALUATED。
+
+## `phase6-parallel-windows.sh`（Gate F 多窗口并行验收 harness；**纯离线：无运行时执行器**）
+
+为 Gate F（后台多窗口并行）提供离线 harness。**本切片没有任何运行时执行器，也未获授权**：不启动
+浏览器、不显示/激活/最小化任何窗口、**没有 `run`/执行模式**，执行 flag 一律 fail-closed 拒绝（rc=1）；
+脚本不再引用任何 app 启动 helper，`tests/tools/parallel-window-cdp-check.py` 也只剩纯证据函数与
+fixture（无 launch/subprocess/签名执行/CDP 导入）。**Gate F 未被通过**；未来 runtime 必须在 gate
+（Gate C 仍 BLOCKED）之后由新的显式任务实现，本切片不描述也不祝福任何可执行路径。
+
+```sh
+tests/phase6-parallel-windows.sh                        # 默认 dry-run：打印未来 runtime 契约与证据契约
+tests/phase6-parallel-windows.sh check --evidence DIR   # 离线校验证据（证据输入只读；仅写 parallel-report.json/md）
+python3 tests/tools/parallel-evidence-check.py --self-test     # 离线 checker fixture 负例
+python3 tests/tools/parallel-window-cdp-check.py --self-test   # 纯证据函数 fixture（离线）
+```
+
+设计要点：
+
+1. **未来 runtime 契约（本切片不实现、不授权）**：Developer ID 签名预检（拒绝 ad-hoc）、
+   `--use-mock-keychain` + 新 `mktemp` profile、`--browser-cli-background-presentation`、启动前先开
+   app-identity watcher（10ms，**原始样本必留**，全程 on-screen 计数必须 0）、经 CDP pipe 创建
+   **≥3 个后台 BrowserWindow**，每个加载**不同的真实 HTTPS 站点**并拥有**独立 active tab**；
+   任何窗口不得被 present/activate/reveal（无 show/reveal/minimize 补救）。以上仅是文字契约，
+   代码中没有对应执行入口。
+2. **Cookie/session 语义**：按 plan 声明的 `cookie_mode` 校验——`shared-profile`（同一 jar、每窗口可回读）
+   或 `isolated-profiles`（jar 互异、无交叉回读）。
+3. **HUMAN/ASSIST 互不影响**：用户手动接管一个窗口时，其余后台窗口的 URL/tab 保持不变，
+   且不出现针对它们的 presentation allow。
+4. **证据契约**（`<evidence>/`）：`parallel-plan.json`（会话契约 + cookie_mode + 窗口矩阵）、
+   `windows.json`（name/window_id/url/active_tab_id/loaded）、`page-content.json`（真实页面 title/body）、
+   `cookie-evidence.json`（jar_id/readback）、`human-assist.json`（接管窗口 + 逐窗口 untouched）、
+   `watcher-samples.txt`（**原始 10ms 样本** + final max=）、`browser.log`（policy 日志）。
+5. **判定（fail closed，吸取 Gate C 教训）**：固定窗口矩阵（w1/w2/w3 background + 真实 HTTPS + 独立 tab）
+   **定义在 checker 代码内**，删减/改名/optional 化即 CONTRADICTION；**watcher 必须存在原始样本**，
+   final-only 的 `max=0` 不是证据（CONTRADICTION），sample 最大值与 final 必须一致且为 0；重复窗口
+   id/URL/active tab、非 https、cookie 模式冲突、HUMAN/ASSIST 期间后台窗口被触碰均 CONTRADICTION；
+   缺证据一律 NOT-EVALUATED。退出码：仅当所有必选检查 PASS 才 0，矛盾 1，证据不足 3。
+6. **截图**：**不在本契约内**——逐窗口截图仍是 Gate C 依赖（Gate C 离线判定器 **BLOCKED**，返工待决），
+   本切片不宣称截图覆盖、也不得据此声称 Gate F 通过。
+7. **静态门禁**：`tests/run-script-tests.sh` 第 27 组与 `tests/check-browser-launch-hygiene.sh`
+   （含本 driver；第 27 组改为**静态源码断言**：driver 拒绝执行 flag、无 app 启动接线，helper 无
+   launch/subprocess/签名执行且只暴露 `--self-test`/fixture 参数；套件不再以执行 flag 调用任何脚本）。
+
+**当前状态（REVIEW，Gate F 未通过；无运行时执行器）**：本切片只有 dry-run 计划、离线 checker 与纯
+fixture/静态证据；**没有运行时证据，也没有可执行入口**。**未来 runtime（须新任务、gate 之后）仍需的明确验收条件**：
+
+1. 签名 App + `--use-mock-keychain` + 新 mktemp profile + managed 开关，watcher（10ms）在启动前运行并保留原始样本；
+2. ≥3 个后台 BrowserWindow 并行加载不同真实 HTTPS 站点（window id 互异），全程 `CGWindowList`/app-identity 计数 0，policy 无 presentation allow；
+3. 每窗口独立 active tab（tab id 互异），激活某窗口的 tab 不影响其它窗口、不使窗口上屏；
+4. Cookie/session 证据符合声明的 profile 模式（共享回读或隔离不串）；
+5. 用户手动接管一个窗口时，其余后台窗口 URL/tab 不变且无 presentation allow；
+6. 证据目录完整并经 `phase6-parallel-windows.sh check` 得 rc=0；
+7. 逐窗口截图：待 Gate C 解除 BLOCKED 后单独验收（本契约不覆盖）；
+8. CPU/GPU/内存与长期运行数据：PROJECT-PROGRESS F 区独立条目，不在本契约内。
 
 ## `check-browser-launch-hygiene.sh`（静态门禁，强制）
 
@@ -566,6 +654,43 @@ Chromium checkout 中 `chrome/app/theme/browser_cli/BRANDING` 完全一致；che
 
 ```sh
 tests/check-identity-consistency.sh
+```
+
+## `user-menu-origin-wiring-check.py`（patch 010 静态接线检查，无浏览器）
+
+静态、只读地验证 patch 010 的两条接线（纯 C++ 单测看不到的部分）：
+`executeCommand:`/`showPreferencesForProfile:`/`orderFrontStandardAboutPanelForProfile:`
+三个 AppKit 菜单回调使用 `ScopedForegroundOrigin(kUserExplicit)`（而非 kInternal）；
+`TabRestorer::RestoreByID` 按值捕获 `views::CurrentForegroundOrigin()` 传给 `TabRestorer`；
+`TabRestorer::TabRestoreServiceLoaded` 用保存的值经共享 helper
+`RunWithForegroundOrigin()` 包住 `DoRestoreTab`；头文件保存 typed
+`views::ForegroundOrigin`（无 int 往返、用 opaque scoped-enum 前置声明避免 ui/views 依赖）。
+只读取 `chrome/browser/app_controller_mac.{h,mm}` 文本，不启动浏览器/不写文件/不访问
+profile/keychain。**尚未接入 `run-script-tests.sh`**（该套件正由工作线 A 修改中），
+主负责人可在其收敛后把 `--self-test` 加入静态组。
+
+```sh
+python3 tests/tools/user-menu-origin-wiring-check.py --checkout ~/dev/chromium/src  # 7 checks
+python3 tests/tools/user-menu-origin-wiring-check.py --self-test   # 8 个 fixture 正/负例
+```
+
+## `omnibox-everywhere-origin-check.py`（patch 011 静态接线检查，无浏览器）
+
+静态、只读地验证 patch 011（Omnibox Everywhere native activation 归因）：
+`mac_window_util.mm::ActivateBrowserWindowOnMac` 必须先经纯函数
+`DecideWindowActivationRoute`；managed + 无来源 → `kNoop`（不 activate/不
+deminiaturize/不 order-front），managed + 已证明浏览器进程用户输入 → 经
+`NativeWidgetMacNSWindowHost::PresentForUserExplicitAction()` 唯一 gateway，只有 stock
+才落到 raw AppKit；`omnibox_everywhere_service.cc::OpenUrl` 必须把 `user_gesture`
+按值转发且自身没有 raw AppKit；`omnibox_everywhere_ui_manager.cc` 的
+`OpenURLFromTab`（WebUI/渲染回调）必须传 `user_gesture=false`，`ExecuteCommand` 的
+4 个原生 context-menu 来源必须传 `true`；并由纯逻辑单测
+`mac_window_util_unittest.cc` 覆盖 route 矩阵。只读源码文本，不启动浏览器/不写文件/
+不访问 profile/keychain。**尚未接入 `run-script-tests.sh`**（该套件正由工作线 A 修改中）。
+
+```sh
+python3 tests/tools/omnibox-everywhere-origin-check.py --checkout ~/dev/chromium/src  # 6 checks
+python3 tests/tools/omnibox-everywhere-origin-check.py --self-test   # 8 个 fixture 正/负例
 ```
 
 ## 签名相关脚本

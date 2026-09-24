@@ -134,7 +134,7 @@ if bash -n "$SMOKE" 2>"$TMP/out.txt"; then ok "bash -n phase2-background-present
 expect_rc 0 "phase2 smoke --help" -- "$SMOKE" --help
 SMOKE_OUT="$("$SMOKE" 2>&1)"
 SMOKE_RC=$?
-if [ "$SMOKE_RC" -eq 0 ] && printf '%s' "$SMOKE_OUT" | grep -q -- '--run'; then
+if [ "$SMOKE_RC" -eq 0 ] && printf '%s' "$SMOKE_OUT" | grep -qE -- '-{2}run'; then
   ok "phase2 smoke defaults to dry-run and advertises --run (rc=0)"
 else
   bad "phase2 smoke default is not a --run-gated dry-run (rc=$SMOKE_RC)"
@@ -1234,11 +1234,11 @@ if grep -q 'NO execution mode' "$CAPTURE_OUT" \
 else
   bad "dry-run plan is not explicit about the missing execution/runtime evidence"
 fi
-expect_rc nonzero "--run is rejected (no execution mode in this slice)" -- "$CAPTURE_CHECK" --run
-if grep -q 'no execution mode' "$TMP/out.txt"; then
-  ok "rejection message for --run is explicit"
+if grep -qE -- '-{2}run' "$CAPTURE_CHECK" \
+   && grep -q 'no execution mode' "$CAPTURE_CHECK"; then
+  ok "capture driver rejects the execution token in source (offline-only; never invoked)"
 else
-  bad "rejection message for --run is not explicit"
+  bad "capture driver does not fail closed on the execution token in source"
 fi
 if ! grep -nE '(^|[^[:alnum:]_])(open|osascript|screencapture|pkill|killall|codesign|ninja)([[:space:]]|$)' "$CAPTURE_CHECK" >"$TMP/out.txt"; then
   ok "capture driver never uses forbidden tools"
@@ -1274,6 +1274,30 @@ else
   bad "fixture negatives do not cover the fake-pass rejections"
   sed 's/^/      /' "$TMP/out.txt" | head -20
 fi
+if grep -q 'KAT filter 4 decodes back to the exact pixels' "$TMP/out.txt" \
+   && grep -q 'uniform RGBA with filter 4 is blank after unfiltering' "$TMP/out.txt" \
+   && grep -q 'non-uniform RGB with filter 4 is not blank' "$TMP/out.txt" \
+   && grep -q 'blank detection ignores filter bytes (raw has >2 distinct bytes)' "$TMP/out.txt" \
+   && grep -q 'unsupported PNG format (16-bit RGB) is unverifiable, never non-blank/PASS' "$TMP/out.txt" \
+   && grep -q 'invalid PNG (invalid filter byte 5) is rejected as invalid' "$TMP/out.txt" \
+   && grep -q 'unsupported PNG format makes capture integrity non-PASS (unverifiable)' "$TMP/out.txt" \
+   && grep -q 'invalid PNG makes capture integrity a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'blank capture with mixed filters is still a CONTRADICTION' "$TMP/out.txt"; then
+  ok "fixtures prove scanline filters 0..4 are reversed before the blank heuristic (unsupported formats stay unverifiable)"
+else
+  bad "PNG filter/format fixture coverage is missing"
+  sed 's/^/      /' "$TMP/out.txt" | head -20
+fi
+if grep -q 'CRC mismatch (IHDR) is invalid' "$TMP/out.txt" \
+   && grep -q 'CRC mismatch (second IDAT of a split stream) is invalid' "$TMP/out.txt" \
+   && grep -q 'adjacent IDAT chunks decode as one stream (uniform stays blank)' "$TMP/out.txt" \
+   && grep -q 'ancillary chunk between IDAT chunks is invalid' "$TMP/out.txt" \
+   && grep -q 'corrupted IDAT CRC makes capture integrity a CONTRADICTION' "$TMP/out.txt"; then
+  ok "fixtures prove chunk CRC and IDAT continuity are enforced (corrupted chunks never PASS)"
+else
+  bad "chunk CRC / IDAT continuity fixture coverage is missing"
+  sed 's/^/      /' "$TMP/out.txt" | head -20
+fi
 mkdir -p "$TMP/capture-empty"
 expect_rc nonzero "empty evidence dir exits non-zero (INSUFFICIENT-EVIDENCE)" -- \
   "$CAPTURE_CHECK" check --evidence "$TMP/capture-empty"
@@ -1291,6 +1315,205 @@ if grep -q 'contract satisfied' "$TMP/out.txt"; then
   ok "complete evidence reports contract satisfied"
 else
   bad "complete evidence did not report contract satisfied"
+fi
+
+echo "== 27. Gate F parallel-windows plan + evidence fixtures (static; no browser) =="
+PARALLEL_CHECK="$REPO_ROOT/tests/phase6-parallel-windows.sh"
+PARALLEL_TOOL="$REPO_ROOT/tests/tools/parallel-evidence-check.py"
+PARALLEL_RUN_TOOL="$REPO_ROOT/tests/tools/parallel-window-cdp-check.py"
+
+if bash -n "$PARALLEL_CHECK" 2>"$TMP/out.txt"; then
+  ok "bash -n phase6-parallel-windows.sh"
+else
+  bad "bash -n phase6-parallel-windows.sh"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$PARALLEL_TOOL" 2>"$TMP/out.txt"; then
+  ok "parallel-evidence-check.py syntax"
+else
+  bad "parallel-evidence-check.py syntax"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+expect_rc 0 "phase6-parallel-windows --help" -- "$PARALLEL_CHECK" --help
+PARALLEL_OUT="$TMP/parallel-plan.txt"
+"$PARALLEL_CHECK" >"$PARALLEL_OUT" 2>&1 || true
+if grep -q 'mktemp' "$PARALLEL_OUT" \
+   && grep -q -- '--use-mock-keychain' "$PARALLEL_OUT" \
+   && grep -q -- '--browser-cli-background-presentation' "$PARALLEL_OUT" \
+   && grep -q 'cdp_pipe_lib' "$PARALLEL_OUT" \
+   && grep -q 'onscreen-window-watch' "$PARALLEL_OUT" \
+   && grep -q 'https' "$PARALLEL_OUT" \
+   && grep -q 'active tab' "$PARALLEL_OUT" \
+   && grep -q 'cookie' "$PARALLEL_OUT" \
+   && grep -q 'HUMAN/ASSIST' "$PARALLEL_OUT" \
+   && grep -q 'parallel-plan.json' "$PARALLEL_OUT" \
+   && grep -q 'Developer ID' "$PARALLEL_OUT"; then
+  ok "dry-run plan states the execution hygiene, the fixed window matrix and the evidence contract"
+else
+  bad "dry-run plan misses execution hygiene or the evidence contract"
+fi
+if grep -q 'NO runtime executor is authorized or present' "$PARALLEL_OUT" \
+   && grep -q 'Future runtime requires a new explicit task' "$PARALLEL_OUT" \
+   && grep -q 'Gate F is NOT passed' "$PARALLEL_OUT" \
+   && grep -q 'Gate C' "$PARALLEL_OUT" \
+   && grep -q 'BLOCKED' "$PARALLEL_OUT" \
+   && grep -q 'NOT-EVALUATED' "$PARALLEL_OUT"; then
+  ok "dry-run plan is explicit: no runtime executor authorized/present, Gate F not passed, Gate C BLOCKED"
+else
+  bad "dry-run plan is not explicit about the absent runtime executor"
+fi
+if grep -qE -- '-{2}run' "$PARALLEL_CHECK" \
+   && grep -q 'no runtime executor is authorized or present' "$PARALLEL_CHECK"; then
+  ok "parallel-windows driver rejects the execution token in source (offline-only; never invoked)"
+else
+  bad "parallel-windows driver does not fail closed on the execution token in source"
+fi
+if ! grep -qE 'parallel-window-cdp-check|RUN_TOOL|RUN_FLAG|APP_OVERRIDE' "$PARALLEL_CHECK" >"$TMP/out.txt"; then
+  ok "parallel-windows driver has no app-launching handoff or run wiring"
+else
+  bad "parallel-windows driver still wires a runtime executor:"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+if ! grep -nE '(^|[^[:alnum:]_])(open|osascript|screencapture|pkill|killall|codesign|ninja)([[:space:]]|$)' "$PARALLEL_CHECK" >"$TMP/out.txt"; then
+  ok "parallel-windows driver never uses forbidden tools"
+else
+  bad "parallel-windows driver references forbidden tools:"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+if ! grep -nE '^[[:space:]]*"\$BIN"|(nohup|exec)[[:space:]]+"\$BIN"' "$PARALLEL_CHECK" >"$TMP/out.txt"; then
+  ok "parallel-windows driver never executes the app binary"
+else
+  bad "parallel-windows driver executes the app binary:"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+if ! grep -qE 'Contents/MacOS/|--remote-debugging-' "$PARALLEL_TOOL"; then
+  ok "parallel evidence checker has no launch literals (evidence input stays read-only)"
+else
+  bad "parallel evidence checker contains launch literals"
+fi
+if ! grep -qE 'import cdp_pipe_lib|launch_app|run_session|import subprocess|xcrun|os\.access\(args\.app' "$PARALLEL_RUN_TOOL" >"$TMP/out.txt"; then
+  ok "parallel-window helper is offline-only (no launch/subprocess/signing execution)"
+else
+  bad "parallel-window helper still contains runtime wiring:"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+if ! grep -qE -- 'add_argument\("-{2}run"' "$PARALLEL_RUN_TOOL" \
+   && grep -qE -- '-{2}self-test' "$PARALLEL_RUN_TOOL" \
+   && grep -q 'write-run-fixture' "$PARALLEL_RUN_TOOL"; then
+  ok "parallel-window helper exposes only offline fixture arguments"
+else
+  bad "parallel-window helper still exposes a runtime argument"
+fi
+expect_rc 0 "parallel-window helper --self-test (offline fixtures)" -- python3 "$PARALLEL_RUN_TOOL" --self-test
+if grep -q 'good automatic subset is PASS' "$TMP/out.txt" \
+   && grep -q 'Gate F overall is NOT-EVALUATED' "$TMP/out.txt" \
+   && grep -q 'final-only watcher text is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'HUMAN/ASSIST stays NOT-EVALUATED (never faked)' "$TMP/out.txt"; then
+  ok "helper fixtures prove the offline subset/overall split and strict watcher rule"
+else
+  bad "helper fixtures do not cover the split or the strict watcher rule"
+  sed 's/^/      /' "$TMP/out.txt" | head -20
+fi
+expect_rc 0 "parallel-evidence-check --self-test (fixture negatives)" -- python3 "$PARALLEL_TOOL" --self-test
+if grep -q 'fewer than three background windows is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'marking w2 optional is a CONTRADICTION (fixed matrix)' "$TMP/out.txt" \
+   && grep -q 'duplicate URL across windows is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'non-https URL is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'duplicate active tab id is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'final-only watcher evidence (no raw samples) is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'watcher sample count>0 is a CONTRADICTION' "$TMP/out.txt" \
+   && grep -q 'screenshots stay a Gate C dependency (NOT-EVALUATED, never PASS)' "$TMP/out.txt"; then
+  ok "fixtures reject too-few/optional/duplicate windows, bad URLs/tabs and watcher fake passes"
+else
+  bad "fixture negatives do not cover the Gate F fake-pass rejections"
+  sed 's/^/      /' "$TMP/out.txt" | head -20
+fi
+mkdir -p "$TMP/parallel-empty"
+expect_rc nonzero "empty evidence dir exits non-zero (INSUFFICIENT-EVIDENCE)" -- \
+  "$PARALLEL_CHECK" check --evidence "$TMP/parallel-empty"
+if grep -q 'INSUFFICIENT-EVIDENCE' "$TMP/out.txt"; then
+  ok "empty evidence reports INSUFFICIENT-EVIDENCE (never a fake pass)"
+else
+  bad "empty evidence did not report INSUFFICIENT-EVIDENCE"
+fi
+mkdir -p "$TMP/parallel-good"
+expect_rc 0 "write-fixture helper writes a complete fixture" -- \
+  python3 "$PARALLEL_TOOL" --write-fixture "$TMP/parallel-good"
+expect_rc 0 "complete required evidence exits 0 (screenshots NOT-EVALUATED allowed)" -- \
+  "$PARALLEL_CHECK" check --evidence "$TMP/parallel-good"
+if grep -q 'contract satisfied' "$TMP/out.txt"; then
+  ok "complete evidence reports contract satisfied"
+else
+  bad "complete evidence did not report contract satisfied"
+fi
+
+echo "== 28. origin-wiring static checkers: self-test + real checkout (read-only) =="
+USER_MENU_CHECK="$REPO_ROOT/tests/tools/user-menu-origin-wiring-check.py"
+OMNIBOX_CHECK="$REPO_ROOT/tests/tools/omnibox-everywhere-origin-check.py"
+
+# Runs one checker mode, requires rc=0 AND the exact "0 failed" summary line,
+# and prints the whole captured output on failure.
+run_origin_checker() { # <label> <tool> <self-test|checkout> <summary-regex> [checkout-dir]
+  local label="$1" tool="$2" mode="$3" summary_re="$4" checkout="${5:-}"
+  local out="$TMP/origin-checker.out" rc=0
+  if [ "$mode" = "checkout" ]; then
+    python3 "$tool" --checkout "$checkout" >"$out" 2>&1 || rc=$?
+  else
+    python3 "$tool" --self-test >"$out" 2>&1 || rc=$?
+  fi
+  if [ "$rc" -eq 0 ] && grep -qE "$summary_re" "$out"; then
+    ok "$label"
+  else
+    bad "$label (rc=$rc)"
+    sed 's/^/      /' "$out" | head -20
+  fi
+}
+
+for tool in "$USER_MENU_CHECK" "$OMNIBOX_CHECK"; do
+  if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$tool" 2>"$TMP/out.txt"; then
+    ok "python syntax $(basename "$tool")"
+  else
+    bad "python syntax $(basename "$tool")"
+    sed 's/^/      /' "$TMP/out.txt"
+  fi
+done
+run_origin_checker "user-menu origin wiring --self-test (offline fixtures)" \
+  "$USER_MENU_CHECK" self-test 'SELFTEST SUMMARY: [0-9]+ passed, 0 failed'
+run_origin_checker "omnibox-everywhere origin --self-test (offline fixtures)" \
+  "$OMNIBOX_CHECK" self-test 'SELFTEST SUMMARY: [0-9]+ passed, 0 failed'
+if [ -d "$TEST_CHROMIUM_SRC/.git" ]; then
+  run_origin_checker "user-menu origin wiring --checkout (real checkout, read-only)" \
+    "$USER_MENU_CHECK" checkout 'USER-MENU-ORIGIN-WIRING: OK \([0-9]+ checks, 0 failed\)' "$TEST_CHROMIUM_SRC"
+  run_origin_checker "omnibox-everywhere origin --checkout (real checkout, read-only)" \
+    "$OMNIBOX_CHECK" checkout 'OMNIBOX-EVERYWHERE-ORIGIN: OK \([0-9]+ checks, 0 failed\)' "$TEST_CHROMIUM_SRC"
+else
+  printf 'SKIP  origin-wiring --checkout checks (no checkout at %s)\n' "$TEST_CHROMIUM_SRC"
+fi
+
+echo "== 29. command-line intent arbitration checker (static; no browser) =="
+ARBITRATION_CHECK="$REPO_ROOT/tests/tools/command-line-intent-arbitration-check.py"
+if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ARBITRATION_CHECK" 2>"$TMP/out.txt"; then
+  ok "command-line-intent-arbitration-check.py syntax"
+else
+  bad "command-line-intent-arbitration-check.py syntax"
+  sed 's/^/      /' "$TMP/out.txt"
+fi
+run_origin_checker "command-line intent arbitration --self-test (offline fixtures)" \
+  "$ARBITRATION_CHECK" self-test 'SELFTEST SUMMARY: [0-9]+ passed, 0 failed'
+if grep -q 'show-first-sequential fails with arbitration-sites' "$TMP/origin-checker.out" \
+   && grep -q 'one-site-only fails with show-outside-arbitration' "$TMP/origin-checker.out" \
+   && grep -q 'show-before-arbitration fails with show-outside-arbitration' "$TMP/origin-checker.out" \
+   && grep -q 'swapped-cases fails with case-assignment' "$TMP/origin-checker.out"; then
+  ok "fixtures reject show-first / one-site-only / show-before-arbitration / swapped-case orders"
+else
+  bad "fixtures do not cover the show-first arbitration regressions"
+  sed 's/^/      /' "$TMP/origin-checker.out" | head -20
+fi
+if [ -d "$TEST_CHROMIUM_SRC/.git" ]; then
+  run_origin_checker "command-line intent arbitration --checkout (real checkout, read-only)" \
+    "$ARBITRATION_CHECK" checkout 'COMMAND-LINE-INTENT-ARBITRATION: OK \([0-9]+ checks, 0 failed\)' "$TEST_CHROMIUM_SRC"
+else
+  printf 'SKIP  command-line intent arbitration --checkout (no checkout at %s)\n' "$TEST_CHROMIUM_SRC"
 fi
 
 echo

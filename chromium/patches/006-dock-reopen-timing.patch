@@ -1,0 +1,198 @@
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 81bade0851..a3bfac657d 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -7,9 +7,12 @@
+ #include <AppKit/AppKit.h>
+ #include <dispatch/dispatch.h>
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <memory>
++#include <string>
+ #include <vector>
+ 
+ #include "base/apple/bridging.h"
+@@ -24,10 +27,12 @@
+ #include "base/feature_list.h"
+ #include "base/files/file_path.h"
+ #include "base/functional/bind.h"
++#include "base/logging.h"
+ #include "base/mac/mac_util.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/not_fatal_until.h"
++#include "base/process/process_handle.h"
+ #include "base/run_loop.h"
+ #include "base/scoped_multi_source_observation.h"
+ #include "base/scoped_observation.h"
+@@ -152,6 +157,7 @@
+ #include "ui/gfx/native_ui_types.h"
+ #include "ui/menus/cocoa/menu_controller.h"
+ #include "ui/native_theme/native_theme.h"
++#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ #include "url/gurl.h"
+ 
+ namespace {
+@@ -264,6 +270,36 @@ void LaunchBrowserStartup(Profile* profile) {
+   return browser;
+ }
+ 
++// Browser CLI: structured observation log for one Dock / Launchpad / app reopen
++// request. A single reopen is correlated by |request_id| across the
++// reopen-enter / profile-ready / window-created / present-return boundaries and
++// carries the |branch| (reused / new / terminal fallback) plus the outcome.
++// Every record has the monotonic |elapsed_ms| since reopen-enter together with
++// the wall-clock |wall_ms| (Unix epoch milliseconds), so samples of an external
++// window-count watcher using the same epoch clock can be aligned with these
++// boundaries. Observation only: nothing is shown, hidden or activated by this
++// logging, and -applicationDidBecomeActive is deliberately not treated as a
++// user click (development plan section 3).
++std::string NewBrowserCliDockReopenRequestId() {
++  static std::atomic<uint64_t> sequence{0};
++  return "dock-reopen-" + base::NumberToString(base::GetCurrentProcId()) + "-" +
++         base::NumberToString(++sequence);
++}
++
++void LogBrowserCliDockReopenBoundary(const std::string& request_id,
++                                     base::TimeTicks reopen_start,
++                                     const char* stage,
++                                     const char* branch,
++                                     const char* result,
++                                     bool managed) {
++  LOG(INFO) << "BROWSER_CLI_DOCK_REOPEN stage=" << stage
++            << " request_id=" << request_id << " branch=" << branch
++            << " result=" << result << " elapsed_ms="
++            << (base::TimeTicks::Now() - reopen_start).InMilliseconds()
++            << " wall_ms=" << base::Time::Now().InMillisecondsSinceUnixEpoch()
++            << " managed=" << (managed ? "yes" : "no");
++}
++
+ // Activates a browser window having the given profile (the last one active) if
+ // possible or creates an empty one if necessary. Returns a pointer to the
+ // activated/new |BrowserWindowInterface|.
+@@ -1858,6 +1894,22 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   if (browser_shutdown::IsTryingToQuit())
+     return NO;
+ 
++  // Browser CLI: structured observation of this one reopen request. The trace
++  // records the reopen-enter boundary and follows the request through the
++  // Browser CLI-specific branches below (reused existing window vs. new window
++  // through RunInLastProfileSafely -> CreateBrowser -> explicit presentation).
++  // It only observes: no window is shown, hidden or activated by the logging,
++  // and only -applicationShouldHandleReopen: (a real Dock / Launchpad / app
++  // reopen) is traced, never -applicationDidBecomeActive.
++  const bool browser_cli_managed = views::NativeWidgetMacNSWindowHost::
++      IsBrowserCliManagedPresentationEnabled();
++  const std::string browser_cli_reopen_request_id =
++      NewBrowserCliDockReopenRequestId();
++  const base::TimeTicks browser_cli_reopen_start = base::TimeTicks::Now();
++  LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
++                                  browser_cli_reopen_start, "reopen-enter",
++                                  "none", "started", browser_cli_managed);
++
+   // Browser CLI: clicking the Dock icon / Launchpad / the app icon is an
+   // explicit user request for the browser and must always win over the
+   // background-presentation policy (development plan invariant 5.2).
+@@ -1883,6 +1935,10 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+     NSSet<NSWindow*>* browserWindows = GetBrowserWindows();
+     if (browserWindows.count) {
+       FocusWindowSetOnCurrentSpace(browserWindows);
++      LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
++                                      browser_cli_reopen_start, "reopen-exit",
++                                      "visible-windows", "focused-existing",
++                                      browser_cli_managed);
+       // We've performed the unminimize, so AppKit shouldn't do anything.
+       return NO;
+     }
+@@ -1892,6 +1948,10 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+           // The entry point should be irrelevant here because the picker is
+           // already open.
+           ProfilePicker::EntryPoint::kNewSessionOnExistingProcess));
++      LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
++                                      browser_cli_reopen_start, "reopen-exit",
++                                      "profile-picker", "picker-already-open",
++                                      browser_cli_managed);
+       return NO;
+     }
+   }
+@@ -1902,6 +1962,9 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   // creating a new one; only when there is no reusable browser window does the
+   // normal new-window path below run. Stock Chromium is unaffected.
+   if (browser_cli::PresentExistingWindowForUserExplicitAction()) {
++    LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
++                                    browser_cli_reopen_start, "present-return",
++                                    "reused", "presented", browser_cli_managed);
+     return NO;
+   }
+ 
+@@ -1923,6 +1986,9 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+       IsProfileSignedOut(lastProfilePath)) {
+     ProfilePicker::Show(ProfilePicker::Params::FromEntryPoint(
+         ProfilePicker::EntryPoint::kProfileLocked));
++    LogBrowserCliDockReopenBoundary(
++        browser_cli_reopen_request_id, browser_cli_reopen_start, "reopen-exit",
++        "profile-picker", "profile-locked", browser_cli_managed);
+     return NO;
+   }
+ 
+@@ -1931,6 +1997,9 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+     app_controller_mac::RunInLastProfileSafely(
+         base::BindOnce(&AttemptSessionRestore),
+         app_controller_mac::kShowProfilePickerOnFailure);
++    LogBrowserCliDockReopenBoundary(
++        browser_cli_reopen_request_id, browser_cli_reopen_start, "reopen-exit",
++        "session-restore", "delegated", browser_cli_managed);
+     return NO;
+   }
+ 
+@@ -1938,20 +2007,37 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   if (ProfilePicker::GetStartupMode() == StartupProfileMode::kProfilePicker) {
+     ProfilePicker::Show(ProfilePicker::Params::FromEntryPoint(
+         ProfilePicker::EntryPoint::kNewSessionOnExistingProcess));
++    LogBrowserCliDockReopenBoundary(
++        browser_cli_reopen_request_id, browser_cli_reopen_start, "reopen-exit",
++        "profile-picker", "picker-shown", browser_cli_managed);
+   } else {
+     // Asynchronously load profile first if needed.
+     // TODO(crbug.com/40261514): Replace CreateBrowser by LaunchBrowserStartup
+     app_controller_mac::RunInLastProfileSafely(
+-        base::BindOnce([](Profile* profile) {
+-          if (!profile) {
+-            return;
+-          }
+-          // Browser CLI: the new window was created in background and its
+-          // internal show was denied; present it as the explicit user action
+-          // that triggered this reopen.
+-          browser_cli::PresentBrowserForUserExplicitAction(
+-              CreateBrowser(profile));
+-        }),
++        base::BindOnce(
++            [](std::string request_id, base::TimeTicks reopen_start,
++               bool managed, Profile* profile) {
++              LogBrowserCliDockReopenBoundary(
++                  request_id, reopen_start, "profile-ready", "new",
++                  profile ? "loaded" : "no-profile", managed);
++              if (!profile) {
++                return;
++              }
++              // Browser CLI: the new window was created in background and its
++              // internal show was denied; present it as the explicit user
++              // action that triggered this reopen.
++              BrowserWindowInterface* browser = CreateBrowser(profile);
++              LogBrowserCliDockReopenBoundary(request_id, reopen_start,
++                                              "window-created", "new",
++                                              "created", managed);
++              const bool presented =
++                  browser_cli::PresentBrowserForUserExplicitAction(browser);
++              LogBrowserCliDockReopenBoundary(
++                  request_id, reopen_start, "present-return", "new",
++                  presented ? "presented" : "not-presented", managed);
++            },
++            browser_cli_reopen_request_id, browser_cli_reopen_start,
++            browser_cli_managed),
+         app_controller_mac::kShowProfilePickerOnFailure);
+   }
+ 

@@ -1,0 +1,55 @@
+diff --git a/chrome/browser/ui/cocoa/history_menu_cocoa_controller.mm b/chrome/browser/ui/cocoa/history_menu_cocoa_controller.mm
+index 67819c2389..fedb7df2e2 100644
+--- a/chrome/browser/ui/cocoa/history_menu_cocoa_controller.mm
++++ b/chrome/browser/ui/cocoa/history_menu_cocoa_controller.mm
+@@ -23,6 +23,7 @@
+ #import "ui/base/cocoa/cocoa_base_utils.h"
+ #include "ui/base/page_transition_types.h"
+ #include "ui/base/window_open_disposition.h"
++#include "ui/views/widget/browser_cli_foreground_origin.h"
+ 
+ using content::OpenURLParams;
+ using content::Referrer;
+@@ -34,12 +35,20 @@
+ //
+ // NB: Takes |node| by value, because the HistoryMenuBridge could be destroyed
+ // before RunInSafeProfileHelper finishes.
+-void OpenURLForItem(HistoryMenuBridge::HistoryItem node,
++void OpenURLForItem(views::ForegroundOrigin foreground_origin,
++                    HistoryMenuBridge::HistoryItem node,
+                     WindowOpenDisposition disposition,
+                     Profile* profile) {
+   if (!profile) {
+     return;  // Failed to load profile, ignore.
+   }
++  // Browser CLI: a click on a History native menu item is a user-explicit
++  // producer. The origin is carried by value from the call sites below, so it
++  // survives the optional RunInProfileSafely hop; scope the actual restore /
++  // navigation here, where the producer really runs, instead of relying on the
++  // thread-local origin that is gone once the Objective-C method's stack
++  // unwinds.
++  views::ScopedForegroundOrigin origin_scope(foreground_origin);
+   // If this item can be restored using TabRestoreService, do so. Otherwise,
+   // just load the URL.
+   if (node.session_id.is_valid()) {
+@@ -91,14 +100,17 @@ - (void)openURLForItem:(const HistoryMenuBridge::HistoryItem*)node {
+   WindowOpenDisposition disposition =
+       ui::WindowOpenDispositionFromNSEvent([NSApp currentEvent]);
+   if (Profile* profile = _bridge->profile()) {
+-    OpenURLForItem(*node, disposition, profile);
++    OpenURLForItem(views::ForegroundOrigin::kUserExplicit, *node, disposition,
++                   profile);
+   } else {
+     // Both HistoryMenuBridge and HistoryMenuCocoaController could get destroyed
+     // before RunInSafeProfileHelper finishes. The callback needs to be
+-    // self-contained.
++    // self-contained; the user-explicit origin is bound by value so the
++    // delayed execution is still attributed to the menu click.
+     app_controller_mac::RunInProfileSafely(
+         _bridge->profile_dir(),
+-        base::BindOnce(&OpenURLForItem, *node, disposition),
++        base::BindOnce(&OpenURLForItem, views::ForegroundOrigin::kUserExplicit,
++                       *node, disposition),
+         app_controller_mac::kIgnoreOnFailure);
+   }
+ }

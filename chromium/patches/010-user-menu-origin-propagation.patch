@@ -1,0 +1,272 @@
+diff --git a/chrome/browser/BUILD.gn b/chrome/browser/BUILD.gn
+index 551dd223f5..0c1cb194dc 100644
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -4218,6 +4218,7 @@ source_set("core_unit_tests") {
+       "//chrome/browser/profiles:profile",
+       "//chrome/common:channel_info",
+       "//components/version_info:channel",
++      "//ui/views",
+     ]
+     if (is_chrome_branded) {
+       deps += [ "//chrome/test/base:scoped_channel_override" ]
+diff --git a/chrome/browser/app_controller_mac.h b/chrome/browser/app_controller_mac.h
+index 62f68487c9..b689338534 100644
+--- a/chrome/browser/app_controller_mac.h
++++ b/chrome/browser/app_controller_mac.h
+@@ -5,6 +5,7 @@
+ #ifndef CHROME_BROWSER_APP_CONTROLLER_MAC_H_
+ #define CHROME_BROWSER_APP_CONTROLLER_MAC_H_
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "chrome/browser/profiles/profile.h"
+@@ -172,6 +173,13 @@ typedef NS_ENUM(NSInteger, ConfirmQuitResult) {
+ 
+ // Functions that may be accessed from non-Objective-C C/C++ code.
+ 
++namespace views {
++// Opaque declaration of the scoped enumeration, whose underlying type is int.
++// The macOS app controller only stores and forwards the value; it never needs
++// the enumerators, so this header stays free of the ui/views component.
++enum class ForegroundOrigin;
++}  // namespace views
++
+ namespace app_controller_mac {
+ 
+ // True if we are currently handling an IDC_NEW_{TAB,WINDOW} command. Used in
+@@ -212,6 +220,15 @@ void RunInProfileSafely(const base::FilePath& profile_dir,
+                         base::OnceCallback<void(Profile*)> callback,
+                         ProfileLoadFailureBehavior on_failure);
+ 
++// Runs |callback| with |origin| re-established for its duration. The app
++// controller uses this to re-apply the origin captured at request time around
++// delayed work (for example the TabRestorer restore callback): the thread-local
++// origin does not survive an asynchronous hop, so callers must capture the
++// value while the user gesture is still on the stack and pass it here when the
++// delayed callback runs. |callback| must be valid.
++void RunWithForegroundOrigin(views::ForegroundOrigin origin,
++                             base::OnceClosure callback);
++
+ // Allows application to terminate when the last Browser is closed by releasing
+ // the keep alive object held by the |AppController|. Note that all commands
+ // received after this call will be ignored, which is OK since the application
+@@ -240,11 +257,17 @@ class TabRestorer : public sessions::TabRestoreServiceObserver {
+   void TabRestoreServiceLoaded(sessions::TabRestoreService* service) override;
+ 
+  private:
+-  TabRestorer(Profile* profile, SessionID session_id);
++  // |foreground_origin| is captured by value when the restore request is made
++  // and re-applied around the delayed restore callback, because the
++  // thread-local origin is gone once the request stack unwinds.
++  TabRestorer(Profile* profile,
++              SessionID session_id,
++              views::ForegroundOrigin foreground_origin);
+ 
+   // Performs the tab restore. Called either in TabRestoreServiceLoaded(), or
+   // directly from RestoreMostRecent()/RestoreByID() if the service was already
+-  // loaded.
++  // loaded. When called from TabRestoreServiceLoaded(), the captured foreground
++  // origin is re-established around the call.
+   static void DoRestoreTab(Profile* profile, SessionID session_id);
+ 
+   base::ScopedObservation<sessions::TabRestoreService,
+@@ -252,6 +275,7 @@ class TabRestorer : public sessions::TabRestoreServiceObserver {
+       observation_{this};
+   raw_ptr<Profile> profile_;
+   SessionID session_id_;
++  views::ForegroundOrigin foreground_origin_;
+ };
+ 
+ // If the current chrome instance is running as a hidden application (with
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 24700388f8..d4083ca4ed 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -1781,13 +1781,17 @@ - (void)executeCommand:(id)sender withProfile:(Profile*)profile {
+ 
+   // Browser CLI: this method is only reached from the AppKit menu dispatch
+   // (-commandDispatch: / -commandFromDock:), which is a real user gesture.
+-  // Attribute the window operations it performs (activating/restoring an
+-  // existing window, showing a dialog in it) to the trusted Chrome UI origin:
+-  // the unattributed default (ForegroundOrigin::kUnknown) is denied on a
+-  // HUMAN-owned window, and the user's own menu actions must never be blocked
+-  // by the AI background policy.
++  // Development plan sections 3 and 5.2 attribute explicit user menu actions
++  // to USER_EXPLICIT, not to the catch-all internal origin: only USER_EXPLICIT
++  // can present an unowned window and grant per-window HUMAN ownership through
++  // the presentation gateway, which is what the New Window / New Incognito /
++  // Restore Recent Tab commands need in managed background mode. kInternal
++  // would leave those windows suppressed (and would only answer on a window
++  // the user already owns). The scope is synchronous and unwinds with this
++  // method; delayed work must capture the origin by value (see TabRestorer),
++  // because the thread-local value is gone once this stack returns.
+   views::ScopedForegroundOrigin browser_cli_user_ui(
+-      views::ForegroundOrigin::kInternal);
++      views::ForegroundOrigin::kUserExplicit);
+ 
+   NSInteger tag = [sender tag];
+ 
+@@ -2306,11 +2310,15 @@ - (IBAction)showPreferencesForProfile:(Profile*)profile {
+     // Failed to load profile, show Profile Picker instead.
+     return;
+   }
+-  // Browser CLI: AppKit menu callback (user gesture); trusted Chrome UI origin
+-  // so activating the user's HUMAN-owned window is not denied. See
+-  // -executeCommand:withProfile:.
++  // Browser CLI: AppKit menu callback (main_menu_builder.mm wires the
++  // "Preferences…" item to -showPreferences:), a real user gesture
++  // (development plan sections 3 and 5.2). USER_EXPLICIT is required when this
++  // callback has to create the target UI: the fallback
++  // chrome::OpenOptionsWindow() creates a BrowserWindow and shows it through
++  // the presentation gateway, which kInternal would leave suppressed in managed
++  // background mode. The scope is synchronous and unwinds with this callback.
+   views::ScopedForegroundOrigin browser_cli_user_ui(
+-      views::ForegroundOrigin::kInternal);
++      views::ForegroundOrigin::kUserExplicit);
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+     chrome::ShowSettings(browser);
+@@ -2333,11 +2341,15 @@ - (IBAction)orderFrontStandardAboutPanelForProfile:(Profile*)profile {
+     // Failed to load profile, show Profile Picker instead.
+     return;
+   }
+-  // Browser CLI: AppKit menu callback (user gesture); trusted Chrome UI origin
+-  // so activating the user's HUMAN-owned window is not denied. See
+-  // -executeCommand:withProfile:.
++  // Browser CLI: AppKit menu callback (main_menu_builder.mm wires the "About"
++  // item to -orderFrontStandardAboutPanel:), a real user gesture (development
++  // plan sections 3 and 5.2). USER_EXPLICIT is required when this callback has
++  // to create the target UI: the fallback chrome::OpenAboutWindow() creates a
++  // BrowserWindow and shows it through the presentation gateway, which
++  // kInternal would leave suppressed in managed background mode. The scope is
++  // synchronous and unwinds with this callback.
+   views::ScopedForegroundOrigin browser_cli_user_ui(
+-      views::ForegroundOrigin::kInternal);
++      views::ForegroundOrigin::kUserExplicit);
+   // Re-use an existing browser, or create a new one.
+   if (BrowserWindowInterface* browser = ActivateBrowser(profile)) {
+     chrome::ShowAboutChrome(browser);
+@@ -3001,6 +3013,13 @@ void RunInProfileSafely(
+       base::BindOnce(&OnProfileLoaded, std::move(callback), on_failure));
+ }
+ 
++void RunWithForegroundOrigin(views::ForegroundOrigin origin,
++                             base::OnceClosure callback) {
++  DCHECK(callback);
++  views::ScopedForegroundOrigin origin_scope(origin);
++  std::move(callback).Run();
++}
++
+ void AllowApplicationToTerminate() {
+   if (NSApp) {
+     [AppController.sharedController allowApplicationToTerminate];
+@@ -3027,7 +3046,13 @@ void AllowApplicationToTerminate() {
+   } else {
+     // TabRestoreService isn't loaded. Tell it to load entries, and call
+     // OpenWindowWithRestoredTabs() when it's done.
+-    std::ignore = new TabRestorer(profile, session_id);
++    //
++    // Browser CLI: capture the request's foreground origin by value now. The
++    // thread-local origin is gone once this stack unwinds, and the delayed
++    // restore must still be attributed to the user action that asked for it
++    // (for example the user menu Restore Recent Tab command).
++    std::ignore =
++        new TabRestorer(profile, session_id, views::CurrentForegroundOrigin());
+     service->LoadTabsFromLastSession();
+   }
+ }
+@@ -3050,8 +3075,12 @@ void AllowApplicationToTerminate() {
+   }
+ }
+ 
+-TabRestorer::TabRestorer(Profile* profile, SessionID session_id)
+-    : profile_(profile), session_id_(session_id) {
++TabRestorer::TabRestorer(Profile* profile,
++                         SessionID session_id,
++                         views::ForegroundOrigin foreground_origin)
++    : profile_(profile),
++      session_id_(session_id),
++      foreground_origin_(foreground_origin) {
+   auto* service = TabRestoreServiceFactory::GetForProfile(profile);
+   DCHECK(service);
+   observation_.Observe(service);
+@@ -3067,7 +3096,14 @@ void AllowApplicationToTerminate() {
+ void TabRestorer::TabRestoreServiceLoaded(
+     sessions::TabRestoreService* service) {
+   observation_.Reset();
+-  DoRestoreTab(profile_, session_id_);
++  // Browser CLI: re-establish the origin captured when the restore was
++  // requested. The whole restore chain is synchronous from here (creating or
++  // finding the window and showing/activating it), so the presentation gateway
++  // sees the user's origin; the helper's scope unwinds before this object is
++  // deleted.
++  RunWithForegroundOrigin(
++      foreground_origin_,
++      base::BindOnce(&TabRestorer::DoRestoreTab, profile_, session_id_));
+   delete this;
+ }
+ 
+diff --git a/chrome/browser/app_controller_mac_unittest.mm b/chrome/browser/app_controller_mac_unittest.mm
+index 1629d6c9b8..3fba9a1911 100644
+--- a/chrome/browser/app_controller_mac_unittest.mm
++++ b/chrome/browser/app_controller_mac_unittest.mm
+@@ -31,6 +31,7 @@
+ #include "testing/platform_test.h"
+ #include "ui/base/l10n/l10n_util_mac.h"
+ #include "ui/base/window_open_disposition.h"
++#include "ui/views/widget/browser_cli_foreground_origin.h"
+ 
+ namespace {
+ 
+@@ -594,3 +595,49 @@ void TearDown() override {
+       app_controller_mac::kIgnoreOnFailure);
+   run_loop.Run();
+ }
++
++// Browser CLI: the app controller re-applies the origin captured at request
++// time around delayed work through the shared RunWithForegroundOrigin()
++// helper (the same helper TabRestorer::TabRestoreServiceLoaded() uses). This
++// covers the production seam: the helper must scope the value to its callback
++// only, and a request captured without attribution must stay unattributed.
++// Pure logic: no window is created or shown.
++TEST_F(AppControllerTest, RunWithForegroundOriginScopesOnlyItsCallback) {
++  EXPECT_EQ(views::CurrentForegroundOrigin(),
++            views::ForegroundOrigin::kUnknown);
++
++  // A user menu dispatch scopes USER_EXPLICIT synchronously; RestoreByID()
++  // captures this value by value before the stack unwinds.
++  views::ForegroundOrigin captured = views::ForegroundOrigin::kUnknown;
++  {
++    views::ScopedForegroundOrigin menu_scope(
++        views::ForegroundOrigin::kUserExplicit);
++    captured = views::CurrentForegroundOrigin();
++  }
++  EXPECT_EQ(views::CurrentForegroundOrigin(),
++            views::ForegroundOrigin::kUnknown);
++
++  bool callback_saw_user_explicit = false;
++  app_controller_mac::RunWithForegroundOrigin(
++      captured, base::BindLambdaForTesting([&callback_saw_user_explicit]() {
++        callback_saw_user_explicit = views::CurrentForegroundOrigin() ==
++                                     views::ForegroundOrigin::kUserExplicit;
++      }));
++  EXPECT_TRUE(callback_saw_user_explicit);
++  // The scope unwinds with the callback.
++  EXPECT_EQ(views::CurrentForegroundOrigin(),
++            views::ForegroundOrigin::kUnknown);
++
++  // An unattributed request (for example a background / SessionRestore path)
++  // cannot borrow the user origin.
++  bool background_saw_user_explicit = false;
++  app_controller_mac::RunWithForegroundOrigin(
++      views::ForegroundOrigin::kUnknown,
++      base::BindLambdaForTesting([&background_saw_user_explicit]() {
++        background_saw_user_explicit = views::CurrentForegroundOrigin() ==
++                                       views::ForegroundOrigin::kUserExplicit;
++      }));
++  EXPECT_FALSE(background_saw_user_explicit);
++  EXPECT_EQ(views::CurrentForegroundOrigin(),
++            views::ForegroundOrigin::kUnknown);
++}

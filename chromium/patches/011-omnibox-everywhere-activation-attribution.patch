@@ -1,0 +1,314 @@
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere/BUILD.gn b/chrome/browser/ui/omnibox/omnibox_everywhere/BUILD.gn
+index 4c134fb007..23b3ba4a32 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere/BUILD.gn
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere/BUILD.gn
+@@ -158,6 +158,9 @@ if (is_mac || is_win) {
+       "omnibox_everywhere_region_select_overlay_unittest.cc",
+       "omnibox_everywhere_ui_manager_unittest.cc",
+     ]
++    if (is_mac) {
++      sources += [ "mac_window_util_unittest.cc" ]
++    }
+     if (use_aura) {
+       sources += [ "omnibox_everywhere_event_handler_aura_unittest.cc" ]
+     }
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.h b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.h
+index 2bae5329f2..72d11bfff3 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.h
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.h
+@@ -21,8 +21,33 @@ namespace omnibox_everywhere {
+ // auxiliary Space.
+ void DisassociatePopupOnMac(gfx::NativeWindow native_window);
+ 
+-// Activates the browser window and ensures macOS switches spaces to Chrome.
+-void ActivateBrowserWindowOnMac(BrowserWindowInterface* bwi);
++// How a browser-window activation requested by an Omnibox Everywhere producer
++// must be routed. Pure so the policy can be unit-tested without a window or a
++// browser process.
++enum class WindowActivationRoute {
++  // Managed Browser CLI without provable user input: fail closed. No app
++  // activation, no native restore and no order-front; the navigation request
++  // keeps whatever decision the presentation policy already made.
++  kNoop,
++  // Managed Browser CLI with a provable browser-process user input: present the
++  // target window through the single USER_EXPLICIT presentation gateway.
++  kExplicitGateway,
++  // Stock Chromium: keep the original native activation behavior below.
++  kDirectAppKit,
++};
++
++// Decides the route for one activation request. |managed_mode| is the Browser
++// CLI managed background-presentation mode; |user_gesture| may only be true for
++// a browser-process user input (an AppKit/Views menu command), never for a
++// renderer-reported or WebUI callback.
++WindowActivationRoute DecideWindowActivationRoute(bool managed_mode,
++                                                  bool user_gesture);
++
++// Activates the browser window and ensures macOS switches spaces to Chrome, or
++// routes through the presentation gateway in managed mode.
++// |user_gesture| is the provenance of the request: only proven browser-process
++// user input may be presented as USER_EXPLICIT.
++void ActivateBrowserWindowOnMac(BrowserWindowInterface* bwi, bool user_gesture);
+ #endif
+ 
+ }  // namespace omnibox_everywhere
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.mm b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.mm
+index 727016a447..5b9c8373bc 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.mm
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.mm
+@@ -9,6 +9,7 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "ui/base/base_window.h"
+ #include "ui/gfx/native_ui_types.h"
++#include "ui/views/cocoa/native_widget_mac_ns_window_host.h"
+ 
+ namespace omnibox_everywhere {
+ 
+@@ -22,15 +23,49 @@ void DisassociatePopupOnMac(gfx::NativeWindow native_window) {
+   }
+ }
+ 
+-void ActivateBrowserWindowOnMac(BrowserWindowInterface* bwi) {
++WindowActivationRoute DecideWindowActivationRoute(bool managed_mode,
++                                                  bool user_gesture) {
++  if (!managed_mode) {
++    return WindowActivationRoute::kDirectAppKit;
++  }
++  return user_gesture ? WindowActivationRoute::kExplicitGateway
++                      : WindowActivationRoute::kNoop;
++}
++
++void ActivateBrowserWindowOnMac(BrowserWindowInterface* bwi,
++                                bool user_gesture) {
+   if (!bwi || !bwi->GetWindow()) {
+     return;
+   }
+ 
+-  // Activate the application before ordering the window front to ensure
+-  // NSWindowDidBecomeKeyNotification is properly delivered and to switch Spaces
+-  // if the target browser window resides on a different Space than the
+-  // dismissed auxiliary popup.
++  // Browser CLI: in managed background-presentation mode the presentation
++  // policy is the only authority. A request whose provenance is not a proven
++  // browser-process user input must not activate the app, restore or order the
++  // window front (the navigation request already went through the policy, which
++  // keeps hidden windows hidden); a proven user input is presented through the
++  // single USER_EXPLICIT gateway, which releases any assist lease, grants
++  // per-window HUMAN ownership and shows/activates the window itself.
++  const WindowActivationRoute route =
++      DecideWindowActivationRoute(views::NativeWidgetMacNSWindowHost::
++                                      IsBrowserCliManagedPresentationEnabled(),
++                                  user_gesture);
++  if (route == WindowActivationRoute::kNoop) {
++    return;
++  }
++  if (route == WindowActivationRoute::kExplicitGateway) {
++    views::NativeWidgetMacNSWindowHost* host =
++        views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++            bwi->GetWindow()->GetNativeWindow());
++    if (host) {
++      host->PresentForUserExplicitAction();
++    }
++    return;
++  }
++
++  // Stock Chromium: unchanged native activation. Activate the application
++  // before ordering the window front to ensure NSWindowDidBecomeKeyNotification
++  // is properly delivered and to switch Spaces if the target browser window
++  // resides on a different Space than the dismissed auxiliary popup.
+   [NSApp activateIgnoringOtherApps:YES];
+ 
+   NSWindow* window = bwi->GetWindow()->GetNativeWindow().GetNativeNSWindow();
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util_unittest.cc b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util_unittest.cc
+new file mode 100644
+index 0000000000..d84b1d8568
+--- /dev/null
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util_unittest.cc
+@@ -0,0 +1,42 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chrome/browser/ui/omnibox/omnibox_everywhere/mac_window_util.h"
++
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace omnibox_everywhere {
++namespace {
++
++// Pure routing matrix for Browser CLI managed background presentation. These
++// tests never create a window and never touch AppKit: they pin the decision
++// that only a provable browser-process user input may route an Omnibox
++// Everywhere activation through the USER_EXPLICIT presentation gateway, while
++// unattributed requests fail closed and stock Chromium keeps its native
++// behavior.
++TEST(OmniboxEverywhereMacWindowUtilTest,
++     ManagedModeWithoutUserInputFailsClosed) {
++  EXPECT_EQ(DecideWindowActivationRoute(/*managed_mode=*/true,
++                                        /*user_gesture=*/false),
++            WindowActivationRoute::kNoop);
++}
++
++TEST(OmniboxEverywhereMacWindowUtilTest,
++     ManagedModeWithUserInputUsesExplicitGateway) {
++  EXPECT_EQ(
++      DecideWindowActivationRoute(/*managed_mode=*/true, /*user_gesture=*/true),
++      WindowActivationRoute::kExplicitGateway);
++}
++
++TEST(OmniboxEverywhereMacWindowUtilTest, StockModeKeepsDirectAppKit) {
++  EXPECT_EQ(DecideWindowActivationRoute(/*managed_mode=*/false,
++                                        /*user_gesture=*/false),
++            WindowActivationRoute::kDirectAppKit);
++  EXPECT_EQ(DecideWindowActivationRoute(/*managed_mode=*/false,
++                                        /*user_gesture=*/true),
++            WindowActivationRoute::kDirectAppKit);
++}
++
++}  // namespace
++}  // namespace omnibox_everywhere
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere/omnibox_everywhere_ui_manager.cc b/chrome/browser/ui/omnibox/omnibox_everywhere/omnibox_everywhere_ui_manager.cc
+index ab9582053d..bf8ee698e6 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere/omnibox_everywhere_ui_manager.cc
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere/omnibox_everywhere_ui_manager.cc
+@@ -1244,7 +1244,13 @@ content::WebContents* OmniboxEverywhereUIManager::OpenURLFromTab(
+         navigation_handle_callback) {
+   auto* service = OmniboxEverywhereServiceFactory::GetForProfile(profile_);
+   if (service) {
++    // Browser CLI: this is a WebContents delegate callback.
++    // `params.user_gesture` is renderer-reported and the overlay WebUI is not
++    // proof of a human action, so the request is not attributed USER_EXPLICIT;
++    // managed background presentation keeps hidden windows hidden (fail
++    // closed).
+     service->OpenUrl(params.url, params.disposition, params.transition,
++                     /*user_gesture=*/false,
+                      std::move(navigation_handle_callback));
+   }
+   return nullptr;
+@@ -1499,9 +1505,14 @@ void OmniboxEverywhereUIManager::ExecuteCommand(int command_id,
+                   if (auto* service =
+                           OmniboxEverywhereServiceFactory::GetForProfile(
+                               profile)) {
++                    // Browser CLI: the async clipboard callback continues the
++                    // user's Paste-and-search context-menu command; the
++                    // provenance is passed by value, never via thread-local
++                    // state.
+                     service->OpenUrl(match.destination_url,
+                                      WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-                                     ui::PAGE_TRANSITION_GENERATED);
++                                     ui::PAGE_TRANSITION_GENERATED,
++                                     /*user_gesture=*/true);
+                   }
+                 }
+               },
+@@ -1517,9 +1528,13 @@ void OmniboxEverywhereUIManager::ExecuteCommand(int command_id,
+     case kManageSearchEngines: {
+       auto* service = OmniboxEverywhereServiceFactory::GetForProfile(profile_);
+       if (service) {
++        // Browser CLI: a native context-menu command is a browser-process user
++        // input, so the target window may be presented as USER_EXPLICIT through
++        // the presentation gateway.
+         service->OpenUrl(chrome::GetSettingsUrl(chrome::kSearchEnginesSubPage),
+                          WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-                         ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++                         ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                         /*user_gesture=*/true);
+       }
+       break;
+     }
+@@ -1549,18 +1564,26 @@ void OmniboxEverywhereUIManager::ExecuteCommand(int command_id,
+     case kCustomizeKeyboardShortcut: {
+       auto* service = OmniboxEverywhereServiceFactory::GetForProfile(profile_);
+       if (service) {
++        // Browser CLI: a native context-menu command is a browser-process user
++        // input, so the target window may be presented as USER_EXPLICIT through
++        // the presentation gateway.
+         service->OpenUrl(chrome::GetSettingsUrl(chrome::kSearchSubPage),
+                          WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-                         ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++                         ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                         /*user_gesture=*/true);
+       }
+       break;
+     }
+     case kSettings: {
+       auto* service = OmniboxEverywhereServiceFactory::GetForProfile(profile_);
+       if (service) {
++        // Browser CLI: a native context-menu command is a browser-process user
++        // input, so the target window may be presented as USER_EXPLICIT through
++        // the presentation gateway.
+         service->OpenUrl(chrome::GetSettingsUrl(chrome::kSearchSubPage),
+                          WindowOpenDisposition::NEW_FOREGROUND_TAB,
+-                         ui::PAGE_TRANSITION_AUTO_BOOKMARK);
++                         ui::PAGE_TRANSITION_AUTO_BOOKMARK,
++                         /*user_gesture=*/true);
+       }
+       break;
+     }
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere_service.cc b/chrome/browser/ui/omnibox/omnibox_everywhere_service.cc
+index 3fbe3ae779..666703117f 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere_service.cc
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere_service.cc
+@@ -233,13 +233,22 @@ void OmniboxEverywhereService::OnHotkeyDropdownClosed() {
+ void OmniboxEverywhereService::OpenUrl(const GURL& url,
+                                        WindowOpenDisposition disposition,
+                                        ui::PageTransition transition) {
+-  OpenUrl(url, disposition, transition, base::NullCallback());
++  OpenUrl(url, disposition, transition, /*user_gesture=*/false,
++          base::NullCallback());
++}
++
++void OmniboxEverywhereService::OpenUrl(const GURL& url,
++                                       WindowOpenDisposition disposition,
++                                       ui::PageTransition transition,
++                                       bool user_gesture) {
++  OpenUrl(url, disposition, transition, user_gesture, base::NullCallback());
+ }
+ 
+ void OmniboxEverywhereService::OpenUrl(
+     const GURL& url,
+     WindowOpenDisposition disposition,
+     ui::PageTransition transition,
++    bool user_gesture,
+     base::OnceCallback<void(content::NavigationHandle&)>
+         navigation_handle_callback) {
+   auto* browser_collection = ProfileBrowserCollection::GetForProfile(profile_);
+@@ -276,8 +285,12 @@ void OmniboxEverywhereService::OpenUrl(
+     // On macOS, when navigating from Loomnibox (an auxiliary overlay window on
+     // a fullscreen Space) to a browser window that may reside on another Space,
+     // explicit application activation and window ordering is required to switch
+-    // Mission Control Spaces to Chrome.
+-    omnibox_everywhere::ActivateBrowserWindowOnMac(bwi);
++    // Mission Control Spaces to Chrome. In managed Browser CLI mode this is
++    // routed through the presentation policy instead: only a proven
++    // browser-process user input (|user_gesture|) may present the target window
++    // as USER_EXPLICIT through the single gateway; every other request leaves
++    // the window state to the policy decision made by Navigate() above.
++    omnibox_everywhere::ActivateBrowserWindowOnMac(bwi, user_gesture);
+ #else
+     if (bwi->GetWindow()) {
+       if (bwi->GetWindow()->IsMinimized()) {
+diff --git a/chrome/browser/ui/omnibox/omnibox_everywhere_service.h b/chrome/browser/ui/omnibox/omnibox_everywhere_service.h
+index d3ce5a6278..7a1530e605 100644
+--- a/chrome/browser/ui/omnibox/omnibox_everywhere_service.h
++++ b/chrome/browser/ui/omnibox/omnibox_everywhere_service.h
+@@ -85,9 +85,19 @@ class OmniboxEverywhereService : public KeyedService {
+   void OpenUrl(const GURL& url,
+                WindowOpenDisposition disposition,
+                ui::PageTransition transition);
++  // |user_gesture| is the provenance of the request. It may only be true for a
++  // browser-process user input (for example an AppKit/Views menu command);
++  // renderer-reported gestures and WebUI callbacks are not proof and must pass
++  // false, which keeps the request fail closed under managed background
++  // presentation.
++  void OpenUrl(const GURL& url,
++               WindowOpenDisposition disposition,
++               ui::PageTransition transition,
++               bool user_gesture);
+   virtual void OpenUrl(const GURL& url,
+                        WindowOpenDisposition disposition,
+                        ui::PageTransition transition,
++                       bool user_gesture,
+                        base::OnceCallback<void(content::NavigationHandle&)>
+                            navigation_handle_callback);
+ 

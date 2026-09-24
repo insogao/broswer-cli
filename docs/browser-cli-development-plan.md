@@ -183,6 +183,13 @@ BACKGROUND automation
 
 用户显式入口最好通过 Browser CLI 自己的 launcher / Dock / 菜单栏 / CLI 明确带入 `USER_EXPLICIT` intent。
 
+命令行中有多个互斥的展示意图时，必须先经过**唯一仲裁点**，再调用任一 producer：只要存在
+Foreground Assist request/release intent，就由 Assist handler 消费整条命令行；即使它同时带有
+`USER_EXPLICIT show`，也必须 fail closed 并记录冲突，不能先执行 show 再补做 Assist 拒绝。
+`--browser-cli-user-explicit-show` 是一个可被命令行组合出来的 intent 标记，不等同于已验证的人类点击；
+组合冲突不能产生 HUMAN 授权或触碰任何窗口。ProcessSingleton 转发与 cold-start 在初始化后都必须
+走同一仲裁入口，并通过“错误的 show-first 顺序会失败”的反例测试锁定优先级。
+
 ---
 
 # 4. 核心行为矩阵
@@ -278,6 +285,12 @@ BACKGROUND 不能阻止：
 > **用户进入 HUMAN 后，AI 无权自动隐藏、最小化、切走或夺回当前窗口。**
 
 只有用户明确执行“交还 AI”，才能回 BACKGROUND。
+
+用户手动打开 Browser CLI 时，目标窗口必须正常显示并进入前台。此后用户手动最小化，
+窗口必须保持最小化，直到用户再次主动恢复；用户切换到其他 App 或窗口时，Browser CLI
+可以保持可见但未激活，不得因后台任务、assist 超时或旧计时器再次主动跳到最前台。
+用户再次明确点击 Dock/窗口可重新激活。验收必须分别观察“用户打开→前台”、
+“用户最小化→不自行恢复”和“用户切走→不自行抢焦点”，不能仅凭初次打开成功判定通过。
 
 ---
 

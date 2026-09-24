@@ -1,0 +1,611 @@
+diff --git a/chrome/browser/app_controller_mac.mm b/chrome/browser/app_controller_mac.mm
+index 7dbdc6340c..24700388f8 100644
+--- a/chrome/browser/app_controller_mac.mm
++++ b/chrome/browser/app_controller_mac.mm
+@@ -47,6 +47,7 @@
+ #include "chrome/app/chrome_command_ids.h"
+ #include "chrome/browser/apps/app_shim/app_shim_termination_manager.h"
+ #include "chrome/browser/apps/platform_apps/app_window_registry_util.h"
++#include "chrome/browser/browser_cli/reopen_window_selection.h"
+ #include "chrome/browser/browser_cli/user_explicit_presentation.h"
+ #include "chrome/browser/browser_features.h"
+ #include "chrome/browser/browser_process.h"
+@@ -1945,27 +1946,94 @@ - (BOOL)applicationShouldHandleReopen:(NSApplication*)theApplication
+   if (hasVisibleWindows) {
+     NSSet<NSWindow*>* browserWindows = GetBrowserWindows();
+     if (browserWindows.count) {
+-      // TODO(browser-cli/p0-assist-dock-takeover): this upstream branch only
+-      // focuses the window set and never attributes USER_EXPLICIT. When the
+-      // focused window is a visible ASSIST-leased window, the user's Dock click
+-      // therefore does not upgrade it to HUMAN, does not release the lease and
+-      // does not cancel the foreground-assist timeout: the pending deadline (or
+-      // an agent release) can still hide the window the user is operating.
+-      // Call chain: applicationShouldHandleReopen: (hasVisibleWindows=YES)
+-      // -> FocusWindowSetOnCurrentSpace -> -[NSWindow makeKeyAndOrderFront:]
+-      // directly, bypassing browser_cli::PresentExistingWindowForUserExplicitAction
+-      // and ui/views/widget NativeWidgetMacNSWindowHost::PresentForUserExplicitAction,
+-      // so BrowserCliPresentationPolicy never sees a kUserExplicit request and
+-      // ForegroundAssistController::OnLeaseReleasedByUserTakeover is never
+-      // called. Tracked as its own P0; do not fold the behavior fix into this
+-      // patch.
+-      FocusWindowSetOnCurrentSpace(browserWindows);
+-      LogBrowserCliDockReopenBoundary(browser_cli_reopen_request_id,
+-                                      browser_cli_reopen_start, "reopen-exit",
+-                                      "visible-windows", "focused-existing",
+-                                      browser_cli_managed);
+-      // We've performed the unminimize, so AppKit shouldn't do anything.
+-      return NO;
++      if (views::NativeWidgetMacNSWindowHost::
++              IsBrowserCliManagedPresentationEnabled()) {
++        // Browser CLI (P0 visible-ASSIST Dock takeover, single-gateway
++        // architecture): this upstream branch focused the already visible
++        // window set directly through AppKit, bypassing the presentation
++        // policy, so a visible ASSIST-leased window never became HUMAN and its
++        // assist timeout could still hide it after the user's Dock click.
++        //
++        // The window the user actually sees must be the one that becomes
++        // HUMAN. Select that focus target exactly once, with no AppKit side
++        // effects, and present it through the single per-window USER_EXPLICIT
++        // gateway (NativeWidgetMacNSWindowHost::PresentForUserExplicitAction ->
++        // ApplyVisibilityState(kShowAndActivateWindow) -> the native bridge's
++        // own activateIgnoringOtherApps/makeKeyAndOrderFront): the gateway is
++        // the only show/activate authority here. If it reports success the
++        // Dock request is consumed and no direct
++        // deminiaturize/makeKeyAndOrderFront/activateIgnoringOtherApps is
++        // allowed; if it refuses or fails, nothing may be activated directly
++        // and the failure is logged under this same Dock request id before the
++        // USER_EXPLICIT-gated reuse/create fallback below handles the click.
++        // The selection must see the complete GetBrowserWindows() collection:
++        // every ordered browser window in the set becomes a candidate, with its
++        // focus attributes read first. A window without a resolvable managed
++        // host is kept as window_id=0 instead of being skipped, so a frontmost
++        // window that AppKit would focus can never be silently replaced by a
++        // window behind it. (The single gateway refuses a window_id=0 target
++        // and the caller then uses the controlled USER_EXPLICIT fallback.)
++        std::vector<browser_cli::ManagedDockReopenCandidate> candidates;
++        for (NSWindow* win in [NSApp.orderedWindows reverseObjectEnumerator]) {
++          if (![browserWindows containsObject:win]) {
++            continue;
++          }
++          browser_cli::ManagedDockReopenCandidate candidate;
++          candidate.focus.is_miniaturized = win.miniaturized;
++          candidate.focus.is_visible = win.visible;
++          candidate.focus.is_on_active_space = win.onActiveSpace;
++          views::NativeWidgetMacNSWindowHost* host =
++              views::NativeWidgetMacNSWindowHost::GetFromNativeWindow(
++                  gfx::NativeWindow(win));
++          candidate.window_id = host ? host->bridged_native_widget_id() : 0;
++          candidates.push_back(candidate);
++        }
++
++        const browser_cli::ManagedDockReopenResult managed_reopen =
++            browser_cli::HandleManagedDockReopen(
++                candidates, base::BindRepeating([](uint64_t window_id) {
++                  views::NativeWidgetMacNSWindowHost* host =
++                      views::NativeWidgetMacNSWindowHost::GetFromWidgetId(
++                          window_id);
++                  if (!host || !host->GetWidget()) {
++                    return false;
++                  }
++                  return browser_cli::PresentNativeWindowForUserExplicitAction(
++                      host->GetWidget()->GetNativeWindow());
++                }));
++
++        if (managed_reopen.outcome ==
++            browser_cli::ManagedDockReopenOutcome::kPresented) {
++          LogBrowserCliDockReopenBoundary(
++              browser_cli_reopen_request_id, browser_cli_reopen_start,
++              "present-return", "visible-windows", "presented",
++              browser_cli_managed);
++          // The gateway activated the selected window; AppKit must not do
++          // anything else for this request.
++          return NO;
++        }
++
++        // The single gateway did not present: either every browser window in
++        // the set is hidden (no focus target), or the target has no managed
++        // host, or the gateway refused/failed. Never activate directly. Log
++        // the failure under the same Dock request id and fall through to the
++        // USER_EXPLICIT-gated reuse/create path (which logs its own outcome).
++        LogBrowserCliDockReopenBoundary(
++            browser_cli_reopen_request_id, browser_cli_reopen_start,
++            "present-return", "visible-windows",
++            managed_reopen.target_window_id != 0 ? "gateway-denied"
++                                                 : "no-focusable-window",
++            browser_cli_managed);
++      } else {
++        // Stock Chromium: unchanged upstream behavior.
++        FocusWindowSetOnCurrentSpace(browserWindows);
++        LogBrowserCliDockReopenBoundary(
++            browser_cli_reopen_request_id, browser_cli_reopen_start,
++            "reopen-exit", "visible-windows", "focused-existing",
++            browser_cli_managed);
++        // We've performed the unminimize, so AppKit shouldn't do anything.
++        return NO;
++      }
+     }
+ 
+     if (ProfilePicker::IsOpen()) {
+diff --git a/chrome/browser/browser_cli/reopen_window_selection.cc b/chrome/browser/browser_cli/reopen_window_selection.cc
+index e0e9f833ac..e35abda201 100644
+--- a/chrome/browser/browser_cli/reopen_window_selection.cc
++++ b/chrome/browser/browser_cli/reopen_window_selection.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/browser/browser_cli/reopen_window_selection.h"
+ 
++#include <vector>
++
+ namespace browser_cli {
+ 
+ size_t SelectReopenWindowCandidate(
+@@ -25,4 +27,55 @@ size_t SelectReopenWindowCandidate(
+                                                    : most_recent_reusable;
+ }
+ 
++size_t SelectReopenFocusCandidate(
++    base::span<const ReopenFocusCandidate> candidates) {
++  size_t frontmost = kNoReopenFocusCandidate;
++  size_t frontmost_miniaturized = kNoReopenFocusCandidate;
++  bool all_miniaturized = true;
++  for (size_t index = 0; index < candidates.size(); ++index) {
++    const ReopenFocusCandidate& candidate = candidates[index];
++    if (candidate.is_miniaturized) {
++      // Candidates are in back-to-front order, so a later index is closer to
++      // the front.
++      frontmost_miniaturized = index;
++    } else if (candidate.is_visible) {
++      all_miniaturized = false;
++      if (candidate.is_on_active_space) {
++        frontmost = index;
++      }
++    }
++  }
++  if (all_miniaturized && frontmost_miniaturized != kNoReopenFocusCandidate) {
++    frontmost = frontmost_miniaturized;
++  }
++  return frontmost;
++}
++
++ManagedDockReopenResult HandleManagedDockReopen(
++    base::span<const ManagedDockReopenCandidate> candidates,
++    const ManagedDockPresentCallback& present) {
++  std::vector<ReopenFocusCandidate> focus_candidates;
++  focus_candidates.reserve(candidates.size());
++  for (const ManagedDockReopenCandidate& candidate : candidates) {
++    focus_candidates.push_back(candidate.focus);
++  }
++  const size_t selected = SelectReopenFocusCandidate(focus_candidates);
++  if (selected == kNoReopenFocusCandidate) {
++    return {};
++  }
++  const uint64_t window_id = candidates[selected].window_id;
++  if (window_id == 0) {
++    // The focus target has no managed host, so the gateway cannot attribute it.
++    // Never fall back to touching AppKit directly; the caller uses the gated
++    // reuse/create path instead.
++    return {};
++  }
++  if (present.Run(window_id)) {
++    return {ManagedDockReopenOutcome::kPresented, window_id};
++  }
++  // The gateway refused or failed: report the same target (for the failure log)
++  // but do not activate it.
++  return {ManagedDockReopenOutcome::kNotPresented, window_id};
++}
++
+ }  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/reopen_window_selection.h b/chrome/browser/browser_cli/reopen_window_selection.h
+index 11eeb56590..d054b21d57 100644
+--- a/chrome/browser/browser_cli/reopen_window_selection.h
++++ b/chrome/browser/browser_cli/reopen_window_selection.h
+@@ -6,8 +6,10 @@
+ #define CHROME_BROWSER_BROWSER_CLI_REOPEN_WINDOW_SELECTION_H_
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ 
+ #include "base/containers/span.h"
++#include "base/functional/callback.h"
+ 
+ namespace browser_cli {
+ 
+@@ -45,6 +47,84 @@ inline constexpr size_t kNoReopenWindow = static_cast<size_t>(-1);
+ size_t SelectReopenWindowCandidate(
+     base::span<const ReopenWindowCandidate> candidates);
+ 
++// One candidate for the app-reopen *focus* scan, in back-to-front order (the
++// reverse of -[NSApplication orderedWindows]). The macOS app controller fills
++// these fields from AppKit; the pure scan below decides which window the
++// upstream focus path would activate.
++struct ReopenFocusCandidate {
++  bool is_miniaturized = false;
++  bool is_visible = false;
++  bool is_on_active_space = false;
++};
++
++// Returned when the focus scan finds no focusable window (every candidate is
++// hidden and not miniaturized).
++inline constexpr size_t kNoReopenFocusCandidate = static_cast<size_t>(-1);
++
++// Chooses the window the explicit Dock / app-reopen focus path activates:
++//   1. the frontmost candidate (the last in back-to-front order) that is
++//      visible and on the active space wins;
++//   2. when every candidate is miniaturized, the frontmost miniaturized
++//      candidate is selected (the caller deminiaturizes it);
++//   3. hidden, non-miniaturized candidates are never selected, and a visible
++//      candidate on another space never falls back to a miniaturized one.
++//
++// This mirrors FocusWindowSetOnCurrentSpace() in app_controller_mac.mm exactly;
++// the AppKit side effects (intermediate orderFront: raises, final
++// deminiaturize / makeKeyAndOrderFront) stay in the caller. Pure function by
++// design, so the selection is deterministic and unit-testable without windows.
++size_t SelectReopenFocusCandidate(
++    base::span<const ReopenFocusCandidate> candidates);
++
++// One candidate for the managed Dock / app-reopen decision: the focus-scan
++// fields plus the policy/host window id of the browser window (0 when the
++// window has no resolvable managed host and therefore cannot be attributed).
++struct ManagedDockReopenCandidate {
++  ReopenFocusCandidate focus;
++  uint64_t window_id = 0;
++};
++
++// Presents |window_id| through the single per-window USER_EXPLICIT presentation
++// gateway and returns whether the presentation was applied. This callback is
++// the only way HandleManagedDockReopen() can make a window visible or active;
++// the decision helper never touches AppKit itself.
++using ManagedDockPresentCallback = base::RepeatingCallback<bool(uint64_t)>;
++
++enum class ManagedDockReopenOutcome {
++  // The gateway presented the single selected window; the Dock request is
++  // consumed and nothing else may be activated for it.
++  kPresented,
++  // No focusable target (all browser windows hidden) or no resolvable window
++  // id, or the gateway refused/failed. The caller must not activate anything
++  // directly and must continue through the USER_EXPLICIT-gated reuse/create
++  // fallback.
++  kNotPresented,
++};
++
++struct ManagedDockReopenResult {
++  ManagedDockReopenOutcome outcome = ManagedDockReopenOutcome::kNotPresented;
++  // The selected target, or 0 when no focusable candidate existed. It is the
++  // exact window id the gateway was (or would have been) called with: the
++  // window that becomes HUMAN is always this one id, never a second selection.
++  uint64_t target_window_id = 0;
++};
++
++// Managed Dock decision (P0 visible-ASSIST Dock takeover):
++//   1. selects the target exactly once with the same rules as the upstream
++//      focus path (SelectReopenFocusCandidate) and no AppKit side effects;
++//   2. calls |present| exactly once, and only for that target's window id;
++//   3. reports kPresented only when the gateway applied the presentation, and
++//      kNotPresented otherwise (hidden set, unresolvable target, or a gateway
++//      denial), in which case the caller must not activate the target and must
++//      use the gated fallback path.
++//
++// Pure w.r.t. AppKit (the only effect is the callback), so the decision and the
++// "presented exactly once / never activated on failure" contract are
++// unit-testable without creating any window.
++ManagedDockReopenResult HandleManagedDockReopen(
++    base::span<const ManagedDockReopenCandidate> candidates,
++    const ManagedDockPresentCallback& present);
++
+ }  // namespace browser_cli
+ 
+ #endif  // CHROME_BROWSER_BROWSER_CLI_REOPEN_WINDOW_SELECTION_H_
+diff --git a/chrome/browser/browser_cli/reopen_window_selection_unittest.cc b/chrome/browser/browser_cli/reopen_window_selection_unittest.cc
+index 0b12a3a7e0..bdd18a158f 100644
+--- a/chrome/browser/browser_cli/reopen_window_selection_unittest.cc
++++ b/chrome/browser/browser_cli/reopen_window_selection_unittest.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <vector>
+ 
++#include "base/test/bind.h"
+ #include "testing/gtest/include/gtest/gtest.h"
+ 
+ namespace browser_cli {
+@@ -77,5 +78,242 @@ TEST(ReopenWindowSelectionTest, UserOwnedNonReusableCandidateIsIgnored) {
+   EXPECT_EQ(SelectReopenWindowCandidate(candidates), 0u);
+ }
+ 
++// ---------------------------------------------------------------------------
++// P0 visible-ASSIST Dock takeover: the pure focus scan. Candidates are in
++// back-to-front order, exactly like the reverse enumeration of
++// -[NSApplication orderedWindows] in app_controller_mac.mm. No window is
++// created or ordered by these tests.
++// ---------------------------------------------------------------------------
++
++ReopenFocusCandidate VisibleOnActiveSpace() {
++  ReopenFocusCandidate candidate;
++  candidate.is_visible = true;
++  candidate.is_on_active_space = true;
++  return candidate;
++}
++
++ReopenFocusCandidate VisibleOffActiveSpace() {
++  ReopenFocusCandidate candidate;
++  candidate.is_visible = true;
++  candidate.is_on_active_space = false;
++  return candidate;
++}
++
++ReopenFocusCandidate Hidden() {
++  return ReopenFocusCandidate();
++}
++
++ReopenFocusCandidate Miniaturized() {
++  ReopenFocusCandidate candidate;
++  candidate.is_miniaturized = true;
++  return candidate;
++}
++
++TEST(ReopenFocusSelectionTest, EmptySetHasNoFocusTarget) {
++  const std::vector<ReopenFocusCandidate> candidates;
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), kNoReopenFocusCandidate);
++}
++
++TEST(ReopenFocusSelectionTest, AllHiddenHasNoFocusTarget) {
++  const std::vector<ReopenFocusCandidate> candidates = {Hidden(), Hidden(),
++                                                        Hidden()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), kNoReopenFocusCandidate);
++}
++
++TEST(ReopenFocusSelectionTest, FrontmostVisibleOnActiveSpaceWins) {
++  const std::vector<ReopenFocusCandidate> candidates = {
++      VisibleOnActiveSpace(), Hidden(), VisibleOnActiveSpace()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), 2u);
++}
++
++TEST(ReopenFocusSelectionTest, VisibleOffActiveSpaceIsNotAFocusTarget) {
++  const std::vector<ReopenFocusCandidate> candidates = {VisibleOffActiveSpace(),
++                                                        Hidden()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), kNoReopenFocusCandidate);
++}
++
++// A visible window on another space must not make the scan fall back to a
++// miniaturized window (all_miniaturized is false), matching the upstream loop.
++TEST(ReopenFocusSelectionTest,
++     MiniaturizedIsNotSelectedWhenAnotherWindowIsVisible) {
++  const std::vector<ReopenFocusCandidate> candidates = {
++      Miniaturized(), VisibleOffActiveSpace()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), kNoReopenFocusCandidate);
++}
++
++TEST(ReopenFocusSelectionTest, AllMiniaturizedSelectsTheFrontmostOne) {
++  const std::vector<ReopenFocusCandidate> candidates = {
++      Miniaturized(), Hidden(), Miniaturized()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), 2u);
++}
++
++TEST(ReopenFocusSelectionTest,
++     VisibleOnActiveSpaceWinsOverAMiniaturizedWindowInFront) {
++  const std::vector<ReopenFocusCandidate> candidates = {VisibleOnActiveSpace(),
++                                                        Miniaturized()};
++  EXPECT_EQ(SelectReopenFocusCandidate(candidates), 0u);
++}
++
++// ---------------------------------------------------------------------------
++// P0 visible-ASSIST Dock takeover: the managed single-gateway decision. The
++// helper makes the selected window visible/active only through the injected
++// presentation callback (the production callback is
++// PresentNativeWindowForUserExplicitAction); it has no other way to touch
++// AppKit, so a denial cannot activate anything. No window is created here.
++// ---------------------------------------------------------------------------
++
++ManagedDockReopenCandidate ManagedCandidate(ReopenFocusCandidate focus,
++                                            uint64_t window_id) {
++  ManagedDockReopenCandidate candidate;
++  candidate.focus = focus;
++  candidate.window_id = window_id;
++  return candidate;
++}
++
++class ManagedDockReopenTest : public testing::Test {
++ protected:
++  ManagedDockReopenResult Run(
++      const std::vector<ManagedDockReopenCandidate>& candidates) {
++    return HandleManagedDockReopen(
++        candidates, base::BindLambdaForTesting([this](uint64_t window_id) {
++          presented_window_ids.push_back(window_id);
++          return present_result;
++        }));
++  }
++
++  // Every call the single presentation gateway received for this decision.
++  std::vector<uint64_t> presented_window_ids;
++  bool present_result = true;
++};
++
++TEST_F(ManagedDockReopenTest, EmptySetFallsBackWithoutPresenting) {
++  const ManagedDockReopenResult result = Run({});
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++TEST_F(ManagedDockReopenTest, AllHiddenFallsBackWithoutPresenting) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Hidden(), 1), ManagedCandidate(Hidden(), 2)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++// The window that becomes HUMAN is exactly the selected focus target, and the
++// gateway is called once for it.
++TEST_F(ManagedDockReopenTest, PresentedWindowIsTheUniqueVisibleTarget) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Hidden(), 1),
++      ManagedCandidate(VisibleOnActiveSpace(), 2)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kPresented);
++  EXPECT_EQ(result.target_window_id, 2u);
++  ASSERT_EQ(presented_window_ids.size(), 1u);
++  EXPECT_EQ(presented_window_ids[0], 2u);
++}
++
++TEST_F(ManagedDockReopenTest, FrontmostVisibleTargetIsTheOnlyPresentedOne) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(VisibleOnActiveSpace(), 3),
++      ManagedCandidate(Hidden(), 1),
++      ManagedCandidate(VisibleOnActiveSpace(), 4)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kPresented);
++  EXPECT_EQ(result.target_window_id, 4u);
++  ASSERT_EQ(presented_window_ids.size(), 1u);
++  EXPECT_EQ(presented_window_ids[0], 4u);
++}
++
++TEST_F(ManagedDockReopenTest, MinimizedTargetIsPresentedOnce) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Miniaturized(), 7), ManagedCandidate(Miniaturized(), 9)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kPresented);
++  EXPECT_EQ(result.target_window_id, 9u);
++  ASSERT_EQ(presented_window_ids.size(), 1u);
++  EXPECT_EQ(presented_window_ids[0], 9u);
++}
++
++TEST_F(ManagedDockReopenTest,
++       OffActiveSpaceWindowDoesNotFallBackToMiniaturized) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(VisibleOffActiveSpace(), 5),
++      ManagedCandidate(Miniaturized(), 6)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++TEST_F(ManagedDockReopenTest,
++       TargetWithoutManagedHostFallsBackWithoutPresenting) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(VisibleOnActiveSpace(), 0)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++// Caller prefiltering regression (08:48 UTC review): the focus selection sees
++// the complete window set, so a frontmost window whose host cannot be resolved
++// (window_id=0) is still the target. The helper must refuse it and must never
++// present the resolvable window behind it; the caller then uses the controlled
++// USER_EXPLICIT fallback. Candidates are in back-to-front order.
++TEST_F(ManagedDockReopenTest,
++       FrontTargetWithoutHostNeverPresentsTheWindowBehind) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(VisibleOnActiveSpace(), 7),   // behind, has a host
++      ManagedCandidate(VisibleOnActiveSpace(), 0)};  // frontmost, no host
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++// Same guard for the minimized case: the frontmost miniaturized target without
++// a host is selected and refused, never the miniaturized window behind it.
++TEST_F(ManagedDockReopenTest,
++       FrontMinimizedTargetWithoutHostNeverPresentsTheWindowBehind) {
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Miniaturized(), 9),   // behind, has a host
++      ManagedCandidate(Miniaturized(), 0)};  // frontmost, no host
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 0u);
++  EXPECT_TRUE(presented_window_ids.empty());
++}
++
++// Gateway denial: the target is named for the failure log, the gateway was
++// called exactly once, and the helper has no direct-activation API, so the
++// native activation count on failure is zero by construction. The caller must
++// continue through the USER_EXPLICIT-gated fallback.
++TEST_F(ManagedDockReopenTest, GatewayDenialNeverActivatesTheTarget) {
++  present_result = false;
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Hidden(), 1),
++      ManagedCandidate(VisibleOnActiveSpace(), 5)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 5u);
++  ASSERT_EQ(presented_window_ids.size(), 1u);
++  EXPECT_EQ(presented_window_ids[0], 5u);
++}
++
++// A gateway denial for the minimized target also never activates it.
++TEST_F(ManagedDockReopenTest, GatewayDenialForMinimizedTargetNeverActivates) {
++  present_result = false;
++  const std::vector<ManagedDockReopenCandidate> candidates = {
++      ManagedCandidate(Miniaturized(), 11)};
++  const ManagedDockReopenResult result = Run(candidates);
++  EXPECT_EQ(result.outcome, ManagedDockReopenOutcome::kNotPresented);
++  EXPECT_EQ(result.target_window_id, 11u);
++  ASSERT_EQ(presented_window_ids.size(), 1u);
++  EXPECT_EQ(presented_window_ids[0], 11u);
++}
++
+ }  // namespace
+ }  // namespace browser_cli
+diff --git a/chrome/browser/browser_cli/user_explicit_presentation.h b/chrome/browser/browser_cli/user_explicit_presentation.h
+index 45c8151a59..75b485a136 100644
+--- a/chrome/browser/browser_cli/user_explicit_presentation.h
++++ b/chrome/browser/browser_cli/user_explicit_presentation.h
+@@ -7,6 +7,7 @@
+ 
+ #include "base/command_line.h"
+ #include "base/files/file_path.h"
++#include "ui/gfx/native_ui_types.h"
+ 
+ class BrowserWindowInterface;
+ 
+@@ -22,6 +23,15 @@ namespace browser_cli {
+ // Chromium.
+ bool PresentBrowserForUserExplicitAction(BrowserWindowInterface* browser);
+ 
++// Presents |native_window| for an explicit user action (Dock / Launchpad /
++// app reopen) that an AppKit focus path selected. Resolves the owning browser
++// window and routes to PresentBrowserForUserExplicitAction(), so exactly that
++// window transitions ASSIST -> HUMAN (lease released, assist timeout
++// cancelled) and no other window is attributed. Returns whether the
++// presentation was applied; false in stock (unmanaged) Chromium and for
++// windows that do not belong to a browser window.
++bool PresentNativeWindowForUserExplicitAction(gfx::NativeWindow native_window);
++
+ // Presents one existing reusable browser window for an explicit user action,
+ // preferring a window the user already owns. Returns true when an existing
+ // window was presented; false means the caller should fall back to creating a
+diff --git a/chrome/browser/browser_cli/user_explicit_presentation.mm b/chrome/browser/browser_cli/user_explicit_presentation.mm
+index 3d569ebede..00294d55c7 100644
+--- a/chrome/browser/browser_cli/user_explicit_presentation.mm
++++ b/chrome/browser/browser_cli/user_explicit_presentation.mm
+@@ -157,6 +157,26 @@ bool PresentBrowserForUserExplicitAction(BrowserWindowInterface* browser) {
+   return PresentBrowserWindowUserExplicitly(browser);
+ }
+ 
++bool PresentNativeWindowForUserExplicitAction(gfx::NativeWindow native_window) {
++  if (!views::NativeWidgetMacNSWindowHost::
++          IsBrowserCliManagedPresentationEnabled()) {
++    return false;
++  }
++  if (!native_window) {
++    return false;
++  }
++  GlobalBrowserCollection* collection = GlobalBrowserCollection::GetInstance();
++  if (!collection) {
++    return false;
++  }
++  BrowserWindowInterface* browser =
++      collection->FindBrowserWithWindow(native_window);
++  if (!browser) {
++    return false;
++  }
++  return PresentBrowserWindowUserExplicitly(browser);
++}
++
+ bool PresentExistingWindowForUserExplicitAction() {
+   if (!views::NativeWidgetMacNSWindowHost::
+           IsBrowserCliManagedPresentationEnabled()) {
