@@ -910,3 +910,28 @@ H1（逐入口证明+按值传播，剩余为普通逐入口审计任务）为�
   交还）与 Assist grant/deny/busy/timeout/接管验收。矩阵新增用例：用户在 HUMAN 窗口
   Cmd+T / '+' / 点 tab 必须仍可用（验证 007 fail-closed 不误伤）。
 - 本轮未 push；未运行任何浏览器；未触碰真实钥匙串/profile。
+
+### 追加（同日晚）：签名失效隐患、readiness 实测、Gate B 会话就绪
+
+- **发现"后续构建使产品签名失效"隐患**：`ninja unit_tests` 等目标的 COPY_BUNDLE_DATA 会把
+  新对象重新拷入 `Browser CLI.app`（主二进制、v8_context_snapshot、多个 dylib 的 mtime 落在
+  unit_tests 构建窗口内），覆盖 15:30 的 Developer ID 签名（重新变回 linker-signed ad-hoc）。
+  phase3 的 fail-closed 签名门禁正确拦截（`VERDICT: FAIL — ad-hoc`），浏览器未被启动。
+  处置与规矩：**产品签名必须是构建序列的最后一步**；构建任何会写 .app 的目标后必须重跑
+  `scripts/build.sh` 重签名。本轮已重签（16:38:51 signature acceptance PASS）。
+- **readiness checker 修复已实测**：以新证据目录 `build-logs/phase3-human-20260924-163230`
+  （profile `profile.ZU3XOv`、DevTools 49838）启动新签名实例后，checker 从另一终端正确报告
+  `process-spawned YES (10 processes)` → `browser-ready READY`（冷启动 196.3s，符合已知
+  dyld 特性）——这正是 2026-09-24 上午"永远 WAIT"的同一场景。
+- **phase3 runbook heredoc bug 修复**：`manual-checklist.md` 生成时模板内 `` `ready` `` 反引号
+  在未加引号的 `<<EOF` 中被当命令替换执行（`line 359: ready: command not found`）；已改为
+  转义反引号（与模板其余部分一致），全量套件复跑 229/229。
+- **Gate B 会话已就绪待用户操作**：隐藏 managed 实例运行中（含 006–014 全部补丁的首次
+  runtime），新 watcher（10ms，app-identity）与 sink 已启动；runbook
+  `build-logs/phase3-human-20260924-163230/manual-checklist.md` 步骤 2 起为用户鼠标动作
+  （Dock/Launchpad 接管、原生最小化/恢复/全屏、ops 页 8 项操作、create-window/tab、CLI show
+  既有窗口与零窗口、可选 URL 负例）。**矩阵新增用例：HUMAN 窗口内 Cmd+T / '+' / 点 tab
+  必须仍可用**（验证 007 默认 kUnknown 不误伤用户路径）。
+- `unit_tests` 构建被有意停止（1246 步剩余）：为避免在 Gate B 会话期间继续改写 .app，
+  两个 chrome 级用例（010 `AppControllerTest.RunWithForegroundOriginScopesOnlyItsCallback`、
+  011 `OmniboxEverywhereMacWindowUtilTest.*`）推迟到矩阵结束后重建运行，届时再重签名。

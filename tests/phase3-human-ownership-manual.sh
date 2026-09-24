@@ -377,7 +377,7 @@ with:
 
     tests/phase3-human-ownership-manual.sh ready --evidence "$EVIDENCE_DIR"
 
-`ready` prints BLOCKED (and exits non-zero) when readiness cannot be bound to
+\`ready\` prints BLOCKED (and exits non-zero) when readiness cannot be bound to
 this profile; that is a fail-closed result, not a pass.
 
 1. Run this launch command in a terminal (your action; managed mode ON so the
