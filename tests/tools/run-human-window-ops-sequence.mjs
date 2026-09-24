@@ -323,6 +323,10 @@ async function main() {
     const detectedId = detectedText.match(/HUMAN window id\s*=\s*(\d+)/)?.[1];
     console.log(`[detect] ${detectedText.split('\n')[0]}`);
     if (!detectedId) throw new Error('extension did not identify a HUMAN window; no ops run');
+    if (detectedId !== String(opsWindow.windowId)) {
+      throw new Error(
+        `Detect targeted extension window ${detectedId} but the ops tab lives in native window ${opsWindow.windowId}; refusing the sequence`);
+    }
     console.log(`    policy log window id=${policyWindowId}; extension API id=${detectedId} (reported independently)`);
     let focusState = await evalValue(pageCdp,
       'chrome.windows.getLastFocused({populate:false}).then(w => ({id:w.id, focused:w.focused}))');

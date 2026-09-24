@@ -24,8 +24,8 @@
 | 可复现 Chromium 开发环境 | DONE | 固定 revision、Xcode 27、首次及增量构建均已验证 | 跨机器复现时重新执行环境门禁 |
 | 产品身份、Logo 与 Developer ID 签名 | DONE | `Browser CLI.app`、固定 Bundle/Team/证书身份、inside-out 签名与验收已通过 | 发布阶段再做 Hardened Runtime、notarization、staple |
 | 后台窗口绝不上屏基础能力 | DONE | Gate A 完整矩阵已由主负责人逐项复核：真实网络/Cookie、Tab/Window、window.open、Extension focus、session restore、启动/崩溃恢复均通过 | 后续改动持续跑 Gate A 回归，进入 USER_EXPLICIT/HUMAN Gate B |
-| 用户显式打开与 HUMAN 所有权 | DOING | Dock 单次人工接管已观察通过：隐藏的 managed 隔离实例经用户 Dock 点击前台激活且未多开；policy 日志记录 HUMAN 授权。其余 Gate B 矩阵仍未完成，详细证据见本文件末尾 2026-09-24 记录 | 修 readiness checker 的跨终端进程发现；再以新鲜 watcher 做可归因验收，并继续其余 Gate B 场景 |
-| Foreground Assist | REVIEW（缺 runtime 证据） | 004/005 已有 lease、producer、host 与计时器的源码/单测；008 处理同窗口新旧 lease ABA、009 处理可见 ASSIST 窗口 Dock 接管（均 REVIEW）；013 的 show+assist 仲裁已完成源码与静态复核，仍无编译、C++ 单测或 App runtime 证据 | 待用户关闭当前 App 并明确进入隔离验收窗口后，用签名隔离 App 验证 grant/deny/busy/timeout/release/用户接管，再考虑 Gate C |
+| 用户显式打开与 HUMAN 所有权 | DOING | Dock 单次人工接管已观察通过：隐藏的 managed 隔离实例经用户 Dock 点击前台激活且未多开；policy 日志记录 HUMAN 授权。2026-09-24 扩展动作串进一步证实 HUMAN 窗口对 8 项 Extension 窗口操作全部 deny、native 保持 normal。统一构建+签名+121/121 单测已完成（001→014 全部首次编译），Gate B 人工矩阵待用户鼠标参与 | 以新签名构建执行 Gate B 人工矩阵（Dock 五时序场景、HUMAN 下用户 tab 操作、菜单/History/TabRestorer、交还；需用户参与），readiness checker 已修复（48/48） |
+| Foreground Assist | REVIEW（编译+单测证据已到，仍缺 runtime） | 004/005/008/013 已全部首次编译并通过单测（assist 25/25、controller 14/14、lease 8/8、policy 32/32）；009 的选窗/单网关纯逻辑 26/26；011 REWORK 1 修复漏改调用方后编译通过 | 用新签名隔离 App 验证 grant/deny/busy/timeout/release/用户接管与冷启动 blocked 负例，再考虑 Gate C |
 | 后台持续渲染与截图 | DOING（静态 checker 已复核；runtime 阻塞） | Gate C 仍无执行器、无真实截图；PNG filter 0..4 解码、所有 chunk CRC 与 IDAT 连续性现已由主负责人源码/反例复核（self-test 102/102、离线套件 229/229、hygiene 14/14、diff check clean），未编译、未运行 App | 用户关闭当前 App 并明确进入隔离验收窗口后，再按 Gate B/Assist 前置次序构建与做真实截图验收 |
 | 后台多窗口并行 | BLOCKED（Gate B/C 前置） | 未授权的 Gate F driver 启动分支与 Python helper launch/CDP 执行器已删除；主负责人复核后离线脚本套件 223/223 PASS。没有 Browser CLI runtime 证据，Gate F 未通过。 | Gate B/Assist 与 Gate C 依赖解除且用户明确授权后，再单独恢复/验证 Gate F runtime；当前不保留可启动入口 |
 | BrowserPilot 单插件接入 | TODO | 未接入 Browser CLI capability | 保持一个插件，同时兼容普通 Chrome 与 Browser CLI |
@@ -821,3 +821,92 @@
 - 最后一项 `chrome.tabs.create({active:false})` 已实际将 page target 数从 2 增至 3；事后只读 CDP 列出 3 个 page targets，且三者 `Browser.getWindowForTarget` 均为同一 `windowId=962960070`；最新 watcher `final max=1`。**没有新增原生窗口**。本次脚本因 harness 缺陷退出 1：新增 target 筛选错误地把原有 `chrome://newtab/` 也算入；已改为比较点击前后的 target ID 集合，并通过 `node --check` 与 `git diff --check`，但修复后的脚本未再运行，因此脚本/整串状态仍不是 PASS。
 - 原始证据：[`build-logs/phase3-human-20260923-115339/human-ops-sequence-20260924T064131058Z.sink.jsonl`](build-logs/phase3-human-20260923-115339/human-ops-sequence-20260924T064131058Z.sink.jsonl)、[`build-logs/phase3-human-20260923-115339/human-ops-sequence-20260924T064131058Z.samples.txt`](build-logs/phase3-human-20260923-115339/human-ops-sequence-20260924T064131058Z.samples.txt)、同目录 `browser.log` 14:41:33–14:41:48 的 policy seq 4–11。需额外调查同日志 14:38:43 的 `origin=internal action=show-and-activate state=human owned=yes reason=human-owned-window-internal-allowed`（此事件先于 Extension 动作；现有证据不能归因到用户还是测试 tab/其他 producer）。不要把它静默忽略，也不要未经调用链确认就认定是 Dock 点击。
 - 记录此观察不提升 Gate B 的整体状态；Dock 接管仅有一次受控人工观察，24A–I、Assist、C/F、BrowserPilot、发布工作均按上方矩阵保留原状态。用户已要求移交新负责人；本轮不恢复过期定时任务，不构建、不替换当前 App、不 commit/push。当前 Browser CLI PID 52615 仍持有 DevTools 63440；如需 build/runtime，须先由用户确认可关闭此隔离实例。
+
+## 新负责人统一构建窗口（2026-09-24，用户授权关闭 PID 52615 + 本地 commit）
+
+用户明确授权两件事后执行：关闭隔离实例进入构建窗口；23 个未提交文件本地 commit（不 push）。
+
+### 保全与环境
+
+- 本地提交 `4027599`（23 文件：patch 006–013、Gate B/C/F 测试工具、HANDOVER 与文档），未 push。Chromium checkout 仍为 `7d0f28c30d`，browser-cli 分支 `main`。
+- PID 52615 核对命令行（隔离 profile `profile.Xn6eWr` + `--use-mock-keychain` + managed 开关 + 测试扩展 + DevTools 63440）后 SIGTERM 温和退出（2s 内），全部子进程与端口一并消失；无残留 watcher/sink（旧 12068/18637 已在前次会话停止）。
+- 提取前先验证 worktree 与 001→013 累积临时 index 逐字节一致（rc=0），确认交接基线无损。
+
+### seq=3 internal allow 归因分析（静态，2026-09-24）
+
+- 时间排除成立：动作串脚本 14:41:31 才连接（sink 文件名与首条 `sentAt` 一致），seq=3 发生在 14:38:43，早 2.8 分钟，**不是脚本动作**。
+- 事件簇：14:38:38.5 / 14:38:43.895 / 14:38:43.899 三次 `chrome://newtab/` 加载尝试（`new_tab_ui.cc:54` 对 NORMAL profile 拒绝旧版 WebUI NTP），55ms 后 seq=3 internal allow，随后两个新 renderer spawn（其一为 extension renderer，即 ops 扩展页面进程，与 14:41 复用 ops Tab 的行为一致）。
+- 旧二进制（001–005）中 `origin=internal` 是 TLS 默认值，任何未 scoped 调用者都是它，本身不携带归因信息；001 明确留有 `ActivateContents`/session restore/远程 app-shim 未归因 TODO。最可能候选：扩展默认 URL 的 tab/window 创建+激活、或用户/DevTools 手工加载 newtab 后的 tab 激活，落在未归因激活路径。
+- 处置：重建后（007 默认 `kUnknown`）同类事件 fail-closed 为 deny；Gate B 人工矩阵已新增"用户在 HUMAN 窗口 Cmd+T / '+' / 点 tab"用例验证 007 不误伤用户路径；重建后若仍见 `origin=internal` allow，其来源必为 007 scoped 的三个 AppKit 菜单入口，归因自然收敛。**暂不需要 producer 回溯 patch**。
+
+### patch 014（新增）与 011 REWORK 1
+
+- **014** `014-presentation-origin-default-comment.patch`（sha256 `5a0d9832…`，1 文件 3+/1-，仅注释）：
+  `browser_cli_presentation_policy.h` 的 `CurrentForegroundOrigin()` 注释仍写 "Defaults to kInternal"，与 007 之后实际默认 `kUnknown`（fail closed）相反；该注释属 001 的原始内容，不回写冻结的 001，以增量文档 patch 修正。
+- **011 REWORK 1**（sha256 `48b13767…`，9 文件 = 原 7 + 2 个 WebUI handler）：统一构建首次编译发现原 011 修改
+  `OmniboxEverywhereService::OpenUrl` 签名（新增 `bool user_gesture`）但漏改两个调用方，
+  `composebox_everywhere_handler.cc:127` 与 `omnibox_everywhere_handler.cc:391` 报
+  `no matching member function`。两处均为 renderer 经 mojo 调入的 WebUI handler（手势为渲染方自报、不可信），
+  按 011 既有模型补 `/*user_gesture=*/false`（与 `OpenURLFromTab` 固定 false 同类）。
+  提取时用 `git add -N` 处理新文件盲点（否则 unittest 文件会静默丢失且重放比对对其失明）；
+  替换后 001→014 全系列重放与 worktree 逐字节一致、worktree 反向 apply 通过、
+  checker self-test 8/8 + checkout 6/6 复跑通过。001–010、012–014 sha256 未变。
+- 这一编译失败本身是"静态 REVIEW ≠ 可编译"的直接证据，验证了统一构建窗口的必要性。
+
+### 统一构建与签名（001→014 首次全部编译）
+
+- `scripts/build.sh` 首跑：ninja 在两个 011 调用方处失败（上述 REWORK 根因）。
+- 修复后重跑：ninja **exit 0**；inside-out Developer ID 签名 **522/522 dylib（Team RAXC5D3A3S）**、
+  designated requirement stable、`signature acceptance: PASS`。证据：
+  `build-logs/unified-build-20260924/`（build.log、build-retry1.log）与
+  `build-logs/build-20260924-151724.log` / `build-20260924-152642.log`。
+
+### C++ 单测（006–014 新增用例首次真实运行）
+
+| 目标 | 结果 |
+| --- | --- |
+| `browser_cli_presentation_policy_unittests`（含 007 未归因矩阵、008 generation） | **32/32** |
+| `browser_cli_foreground_lease_unittests` | **8/8** |
+| `browser_cli_managed_presentation_unittests`（AppKit） | **2/2** |
+| `foreground_assist_unittests`（含 013 仲裁 8 例） | **25/25** |
+| `foreground_assist_controller_unittests`（含 008 ABA 回归） | **14/14** |
+| `reopen_window_selection_unittests`（009 单网关/完整集合选窗） | **26/26** |
+| `user_explicit_show_unittests`（003） | **14/14** |
+
+合计 **121/121 全部 PASS**（多数为静态编写、此前从未编译运行的用例）。010 的
+`AppControllerTest.RunWithForegroundOriginScopesOnlyItsCallback` 与 011 的
+`OmniboxEverywhereMacWindowUtilTest.*` 位于 `unit_tests` 大二进制，构建完成后
+以 gtest filter 运行（结果见下方追加记录）。
+
+### thin repo 修复与静态门禁
+
+- **readiness checker 跨终端发现缺陷已修**：`browser-readiness-check.py::scan_process_table()`
+  的 `ps -ww`（无 `-a/-x`）只列出与调用者同终端的进程，checker 从其它终端/无 TTY 运行时
+  永远看到 0 个 profile 进程并 WAIT。改为 `ps -axww`，新增 4 个 fixture（PID 1 可见 =
+  TTY-less 进程可发现、caller 自身可见、真实进程表解析、profile-bound 负例），
+  self-test **48/48**（原 44/44）。
+- **动作串脚本补强**：Detect 报告的 HUMAN 窗口与 ops Tab 所在原生窗口（同一 extension
+  API id 空间）现在强制相等，否则拒绝执行；policy log 的 widget id 与 extension API id
+  仍属不同空间，仅打印对照。`node --check`、`git diff --check` 通过；修复后的整串仍未复跑
+  （需用户在场保持窗口前台）。
+- **hygiene checker 分类修正**：`run-human-window-ops-sequence.mjs` 被
+  `--remote-debugging-port` 正则误分类为"浏览器启动入口"；实际它是 connect-only 手工取证
+  脚本（只校验已运行实例的参数，spawn 的仅被动窗口 watcher 与本地 sink，watcher 经源码复核
+  仅用 proc_pidpath 匹配 app identity、不启动任何进程）。按仓库既有 EXCLUDE_NAMES 机制排除
+  并注明理由；门禁复跑 **14 入口 OK**。
+- 全量离线套件 **229/229**、launch hygiene **OK**、`git diff --check` clean。
+
+### 24D/24F/24H 决策备忘
+
+新增 [`docs/product-decisions-24D-24F-24H-2026-09-24.md`](docs/product-decisions-24D-24F-24H-2026-09-24.md)：
+D1（外部 openURL 永不前台，维持 fail-closed）、F1（维持 kUnknown 合并，证据触发再升级）、
+H1（逐入口证明+按值传播，剩余为普通逐入口审计任务）为负责人建议，待用户确认后关闭对应 BLOCKED 项。
+
+### 当前边界与下一步
+
+- Gate B 人工矩阵与 Assist runtime 验收尚未执行；本轮一切编译/单测证据不替代 runtime/人工验收。
+- 下一步：`unit_tests` 中两个 chrome 级用例运行；然后以新签名构建启动隔离实例（runbook 参数），
+  由用户执行 Gate B 人工矩阵（Dock 五时序场景、HUMAN 下用户 tab/菜单操作、扩展动作串复跑、
+  交还）与 Assist grant/deny/busy/timeout/接管验收。矩阵新增用例：用户在 HUMAN 窗口
+  Cmd+T / '+' / 点 tab 必须仍可用（验证 007 fail-closed 不误伤）。
+- 本轮未 push；未运行任何浏览器；未触碰真实钥匙串/profile。

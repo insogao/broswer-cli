@@ -1,0 +1,15 @@
+diff --git a/ui/views/widget/browser_cli_presentation_policy.h b/ui/views/widget/browser_cli_presentation_policy.h
+index 2e0d23722e..081a3b6da6 100644
+--- a/ui/views/widget/browser_cli_presentation_policy.h
++++ b/ui/views/widget/browser_cli_presentation_policy.h
+@@ -91,7 +91,9 @@ enum class ForegroundOrigin {
+ };
+ 
+ // The foreground origin attributed to presentation requests made on the
+-// current thread. Defaults to ForegroundOrigin::kInternal. Producers that can
++// current thread. Defaults to ForegroundOrigin::kUnknown (fail closed, per
++// patch 007): an unscoped request carries no provenance and is treated like
++// automation. Producers that can
+ // be attributed safely wrap their synchronous browser-window request with
+ // ScopedForegroundOrigin; the state lives inside the ui/views component so
+ // that the single BrowserCliPresentationPolicy instance observes it.

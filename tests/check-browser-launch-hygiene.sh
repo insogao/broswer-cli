@@ -52,7 +52,15 @@ done
 SCAN_DIRS=(tests scripts cli launcher browserpilot-integration)
 # Meta harnesses / signature tooling that only contain .app paths inside
 # negative fixtures or codesign invocations and never launch a browser.
-EXCLUDE_NAMES=(check-browser-launch-hygiene.sh run-script-tests.sh sign-browser-cli.sh verify-signature.sh)
+# run-human-window-ops-sequence.mjs is a CONNECT-ONLY manual-evidence script:
+# it attaches CDP to an already-running isolated instance (started by the
+# phase3 runbook with mock keychain + mktemp profile) and only VERIFIES that
+# the running process carries --use-mock-keychain/--user-data-dir/--remote-
+# debugging-port; it never launches, closes, or re-args the browser, and its
+# only spawns are the read-only window watcher and the local result sink.
+# It is excluded from launcher rules because requiring mktemp/--user-data-dir
+# literals here would be satisfied vacuously (it creates no profile at all).
+EXCLUDE_NAMES=(check-browser-launch-hygiene.sh run-script-tests.sh sign-browser-cli.sh verify-signature.sh run-human-window-ops-sequence.mjs)
 # Any app bundle executable launch, regardless of the product name
 # (`.../Contents/MacOS/...` or `$APP_BIN` / `$PRODUCT_APP_BIN`), plus explicit
 # remote-debugging launches (covers launchers that receive the app path).

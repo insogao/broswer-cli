@@ -140,7 +140,7 @@ def match_main_process_lines(text, bin_path, profile_dir):
 
 
 def parse_ps_output(text, bin_path, profile_dir):
-    """Returns (main_pids, profile_pids) from `ps -ww -o pid=,command=`."""
+    """Returns (main_pids, profile_pids) from `ps -axww -o pid=,command=`."""
     main_pids = [
         pid for pid, _ in match_main_process_lines(text, bin_path, profile_dir)
     ]
@@ -336,10 +336,16 @@ def check_signature(app_dir, team_id):
 
 
 def scan_process_table():
-    """Read-only `ps` table; empty string when the scan fails (fail closed)."""
+    """Read-only `ps` table; empty string when the scan fails (fail closed).
+
+    Uses `-axww`: without `-a`/`-x` BSD `ps` only lists processes that share
+    the CALLER's controlling terminal, so a checker invoked from a different
+    terminal (or with no TTY at all) silently saw zero Browser CLI processes
+    and reported WAIT forever against a running main process. `-a -x` lists
+    other users' and TTY-less processes; `-ww` keeps full command lines."""
     try:
         result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=,command="],
+            ["ps", "-axww", "-o", "pid=,command="],
             capture_output=True,
             text=True,
             timeout=30,
@@ -821,6 +827,30 @@ def run_self_test():
             probe_devtools(closed_port, timeout=1.0) is False,
         )
         check("probe_devtools returns None without a port", probe_devtools(0) is None)
+
+        # 6c. process-table scan must see processes OUTSIDE the caller's TTY.
+        # Regression fixture for the readiness WAIT bug: `ps -ww` (no -a/-x)
+        # only lists the caller's own terminal, so a checker run from another
+        # terminal reported 0 profile processes while the browser was running.
+        # launchd (PID 1) never shares the caller's TTY, and this Python
+        # process is in the table by construction; both must be visible and
+        # every line must still parse as `pid command`.
+        ps_text = scan_process_table()
+        ps_pids = set()
+        for line in ps_text.splitlines():
+            pid, _, _ = line.strip().partition(" ")
+            if pid.isdigit():
+                ps_pids.add(int(pid))
+        check("scan_process_table lists TTY-less processes (PID 1)", 1 in ps_pids, repr(sorted(ps_pids)[:5]))
+        check("scan_process_table lists the caller process", os.getpid() in ps_pids)
+        check(
+            "scan_process_table output parses with match_main_process_lines",
+            len(ps_pids) > 1,
+        )
+        main_pids, profile_pids = parse_ps_output(
+            ps_text, "definitely-not-the-browser-binary", "/nonexistent/profile"
+        )
+        check("parse_ps_output stays profile-bound against the real table", main_pids == [] and profile_pids == [])
 
         # 7. evidence recording appends one JSON line.
         record_evidence(tmp, collect_phases(tmp), "selftest")

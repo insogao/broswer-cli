@@ -312,3 +312,35 @@ index d3ce5a6278..7a1530e605 100644
                         base::OnceCallback<void(content::NavigationHandle&)>
                             navigation_handle_callback);
  
+diff --git a/chrome/browser/ui/webui/omnibox_everywhere/composebox_everywhere_handler.cc b/chrome/browser/ui/webui/omnibox_everywhere/composebox_everywhere_handler.cc
+index d94c7f70fd..7eb9861c71 100644
+--- a/chrome/browser/ui/webui/omnibox_everywhere/composebox_everywhere_handler.cc
++++ b/chrome/browser/ui/webui/omnibox_everywhere/composebox_everywhere_handler.cc
+@@ -124,8 +124,10 @@ void ComposeboxEverywhereHandler::OpenUrl(
+     base::OnceCallback<void(content::NavigationHandle&)>
+         navigation_handle_callback) {
+   if (service_) {
++    // WebUI handler: invoked from the renderer over mojo, whose gesture state
++    // is renderer-self-reported and untrustworthy. Fail closed (patch 011).
+     service_->OpenUrl(url, disposition, ui::PAGE_TRANSITION_LINK,
+-                      std::move(navigation_handle_callback));
++                      /*user_gesture=*/false, std::move(navigation_handle_callback));
+   }
+ }
+ 
+diff --git a/chrome/browser/ui/webui/omnibox_everywhere/omnibox_everywhere_handler.cc b/chrome/browser/ui/webui/omnibox_everywhere/omnibox_everywhere_handler.cc
+index b5925765d3..294dbaaf2f 100644
+--- a/chrome/browser/ui/webui/omnibox_everywhere/omnibox_everywhere_handler.cc
++++ b/chrome/browser/ui/webui/omnibox_everywhere/omnibox_everywhere_handler.cc
+@@ -388,8 +388,10 @@ void OmniboxEverywhereHandler::OpenUrl(
+     base::OnceCallback<void(content::NavigationHandle&)>
+         navigation_handle_callback) {
+   if (service_) {
++    // WebUI handler: invoked from the renderer over mojo, whose gesture state
++    // is renderer-self-reported and untrustworthy. Fail closed (patch 011).
+     service_->OpenUrl(url, disposition, ui::PAGE_TRANSITION_LINK,
+-                      std::move(navigation_handle_callback));
++                      /*user_gesture=*/false, std::move(navigation_handle_callback));
+   }
+ }
+ 
