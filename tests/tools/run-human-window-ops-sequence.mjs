@@ -306,9 +306,15 @@ async function main() {
     }
     pageCdp = new Cdp(pageMeta.webSocketDebuggerUrl);
     await pageCdp.open();
-    await waitFor(async () => evalValue(pageCdp,
-      `document.readyState === 'complete' && !!document.getElementById('detect')`),
-    'ops page ready');
+    // A freshly created extension tab can transiently answer CDP evals with
+    // "No web contents in the target" before its renderer is up; treat those
+    // as not-ready instead of aborting the whole sequence.
+    await waitFor(async () => {
+      try {
+        return await evalValue(pageCdp,
+          `document.readyState === 'complete' && !!document.getElementById('detect')`);
+      } catch { return false; }
+    }, 'ops page ready');
 
     console.log(`Browser: ${version.Browser}; PID ${main.pid}; profile ${state.PROFILE_DIR}`);
     console.log(`Human policy window=${policyWindowId}; reused native window=${opsWindow.windowId}`);

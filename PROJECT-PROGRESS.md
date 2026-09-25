@@ -932,6 +932,45 @@ H1（逐入口证明+按值传播，剩余为普通逐入口审计任务）为�
   （Dock/Launchpad 接管、原生最小化/恢复/全屏、ops 页 8 项操作、create-window/tab、CLI show
   既有窗口与零窗口、可选 URL 负例）。**矩阵新增用例：HUMAN 窗口内 Cmd+T / '+' / 点 tab
   必须仍可用**（验证 007 默认 kUnknown 不误伤用户路径）。
-- `unit_tests` 构建被有意停止（1246 步剩余）：为避免在 Gate B 会话期间继续改写 .app，
-  两个 chrome 级用例（010 `AppControllerTest.RunWithForegroundOriginScopesOnlyItsCallback`、
-  011 `OmniboxEverywhereMacWindowUtilTest.*`）推迟到矩阵结束后重建运行，届时再重签名。
+### Gate B 人工矩阵执行（2026-09-24 晚，新签名 001→014 构建，用户参与）
+
+场景与证据（证据目录 `build-logs/phase3-human-20260924-163230/`，实例 PID 43603→50382）：
+
+| 场景 | 结果 | 关键证据 |
+| --- | --- | --- |
+| Dock 点击接管（隐藏→HUMAN） | **PASS** | 006 request-id 首次 runtime：`dock-reopen-43603-2` profile-ready(22ms)→window-created(95ms)→presented(112ms)；policy `human-ownership-granted window_id=6 owned_windows=1` + `allow origin=user-explicit` |
+| Dock 二次点击（visible-windows 分支） | **PASS** | `dock-reopen-43603-3` branch=visible-windows，3ms presented，window_id 不变，无多开 |
+| 用户聚焦时 Extension 8 项窗口操作 | **PASS（首次聚焦场景）** | 动作串脚本 OPS_SEQ_EXIT=0（历史上首次完整通过）：API 全 ok=true 但 state normal→normal、focused true→true（含 focus:false 未能夺焦）；policy seq 36–43 全部 `deny origin=extension win=6 state=human owned=yes`；watcher `final max=1 nonzero=15050` |
+| HUMAN 下 create-tab | **PASS** | pages 3→4，唯一新增 tab 落同一原生窗口 511740279，桌面保持 1 |
+| HUMAN 下 create background window | **PASS** | API 创建 2 个 model 窗口（探针两次点击），`suppress window-created widget_id=16..21 managed-mode-at-creation`，`deny set-z-order origin=extension`，桌面可见数保持 1 |
+| CLI show 既有窗口 | **PASS** | producer `result=handled reason=existing-window-presented managed=yes`（003 首次 runtime）+ `allow origin=user-explicit`，无重复窗口 |
+| CLI show + URL 负例 | **PASS** | producer `result=denied reason=launch-arguments-not-user-explicit`，桌面保持 1 |
+| CLI show 零窗口 | **PASS** | show 前 watcher count=0 → `window-created-and-presented` + 新实例 `human-ownership-granted window_id=1` → count=1，恰好 1 个 page target，无 profile picker/session restore 混入 |
+| 窗口销毁释放所有权 | **PASS** | 旧实例 Browser.close 时 `human-ownership-released window_id=6 reason=window-destroyed`（per-window 生命周期闭环） |
+| 用户 Cmd+T | **PASS（观察级）** | 2 个新 newtab page 均在同一原生窗口 |
+
+动作串脚本两次 harness 修复后首次整串通过：①就绪等待容忍新 tab 渲染器竞态（`No web contents in the target`）；②焦点等待 120s 超时后以 `--focus-timeout-ms 600000` 重跑成功。Detect/ops 同窗交叉断言首次实战通过（policy window 6 ↔ extension API 511740279 独立对齐）。
+
+### Collector 报告与新发现的原生旁路（2026-09-24 晚）
+
+- collect 报告 **1 个 CONTRADICTION**：`watcher-no-transient-window max=4`。已精确归因：
+  **17:02:06–17:02:12（6 秒，467 样本）**，全部属于 PID 43603——主窗口之外出现顶部 2560×124 与底部 2560×47 两个 overlay 条（疑似 Omnibox Everywhere 或 find bar 类瞬时 UI，用户交互触发；该时段无任何自动化动作在运行）。
+- **实质发现：存在不经 gateway 的原生窗口上屏旁路。** 同一时刻 widgets 9/10 的
+  `show-inactive origin=unknown` 请求被 policy/host/AppKit 三层 deny（**007 fail-closed 首次实战**），但这两个 overlay 窗口仍出现在桌面 6 秒。即其排序/显示走了未接入
+  PresentationPolicy gateway 的路径（NSPanel/overlay 类窗口疑似不经 NativeWidgetNSWindowBridge 的 visibility state）。
+  本次为用户触发、6 秒即逝、无自动化 origin，不判 Gate B 失败；但列为**新待查项（Gate B 后续）**：
+  归因这两个 overlay 的窗口类与创建/排序调用链，评估是否补 gateway 接入或将其归类为
+  允许的用户瞬时 UI。在此之前"AI 永不偷弹"对该窗口类尚未闭合。
+- 未覆盖项（如实保留）：Dock 五时序场景（全最小化/全隐藏/跨 Space/点击后迅速切走）、Launchpad/菜单栏/History/TabRestorer 用户入口（010/012 runtime）、用户原生最小化/恢复/全屏人工确认、"交还 AI"用例、失焦场景在新二进制下的复测（上午旧二进制已有证据）。
+
+### 状态更新（2026-09-24 晚）
+
+- C 区以下条目基于本日 runtime 证据转 **DONE（主负责人复核=新负责人本人）**：
+  「用户处于 HUMAN 时，AI 不得隐藏、最小化、切换或夺回该窗口」（聚焦+失焦双场景、三层证据）；
+  「HUMAN 窗口存在时，AI 仍可创建互不影响的后台 Window/Tab」；
+  「CLI 显式 show 可打开指定目标」（既有/零窗口/URL 负例三用例）。
+- 「用户点击 Dock 可打开、激活既有窗口」维持单次人工观察记录并补充 006 request-id 证据（比 09-24 上午更强的归因）。
+- Gate B 整体矩阵仍未通过：上述未覆盖项 + 新发现的原生旁路待查。
+- 排队中：`unit_tests` 重建 + 两个 chrome 级用例（010 AppController seam、011 route 矩阵）→
+  完成后必须重跑 `scripts/build.sh` 重签名（本轮已验证：任何写 .app 的构建都会破坏签名）；
+  Assist runtime 验收；overlay 旁路归因。
