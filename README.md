@@ -5,6 +5,7 @@
 [`AGENTS.md`](AGENTS.md)；本 README 的阶段快照较早，不覆盖进度表中的当前结论。
 
 面向 AI Agent 的 Chromium 浏览器运行时。宏观设计见 [`docs/browser-cli-development-plan.md`](docs/browser-cli-development-plan.md)。
+macOS / Windows 共用代码边界与 Windows 移植门禁见 [`docs/windows-port-plan.md`](docs/windows-port-plan.md)；Windows 当前尚未构建或验收。
 
 本仓库**只保存**：
 
